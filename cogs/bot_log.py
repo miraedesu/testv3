@@ -101,6 +101,7 @@ class BotLog(commands.Cog):
             logger.warning("[BotLog] BOTMSG_CHANNEL not set in .env — cog will be inert.")
         else:
             self._resolve_task = asyncio.create_task(self._resolve_log_channel())
+            self.bot._self_deleted_messages: set[int] = set()
 
     async def _resolve_log_channel(self) -> None:
         await self.bot.wait_until_ready()
@@ -183,7 +184,10 @@ class BotLog(commands.Cog):
         # Skip deletions in our own log channel (would be recursive noise)
         if message.channel.id == self._log_channel.id:
             return
-
+        # Skip messages the bot is deleting itself (twitter-fix cleanup, etc.)
+        if message.id in getattr(self.bot, "_self_deleted_messages", set()):
+            self.bot._self_deleted_messages.discard(message.id)
+            return
         # Check audit log FIRST — before building anything
         deleted_by = None
         if message.guild:

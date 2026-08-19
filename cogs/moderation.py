@@ -518,6 +518,8 @@ class Moderation(commands.Cog):
 
         try:
             msg = await channel.fetch_message(payload.message_id)
+            if hasattr(self.bot, "_self_deleted_messages"):
+                self.bot._self_deleted_messages.add(payload.message_id)
             await msg.delete()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
