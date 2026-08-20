@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from common.constants import FEATURE_CHOICES_DATA
+from common.constants import FEATURE_CHOICES_DATA, OPT_IN_FEATURES, OPT_IN_COMMANDS
 from common.feature_toggles import (
     disable_feature as db_disable_feature,
     enable_feature as db_enable_feature,
@@ -254,7 +254,21 @@ class GuildSettings(commands.Cog):
                 ephemeral=True,
             )
             return
-
+        # Opt-in features can only be initially enabled by the bot owner.
+        # Guild admins may still clear their own channel-specific disables
+        # of an already-enabled opt-in feature.
+        if feature in OPT_IN_FEATURES:
+            async with self.bot.db.execute(
+                "SELECT 1 FROM enabled_features WHERE guild_id = ? AND feature_name = ?",
+                (interaction.guild.id, feature),
+            ) as cursor:
+                if not await cursor.fetchone():
+                    await interaction.response.send_message(
+                        f"🔒 `{feature}` is an opt-in feature — only the bot owner can enable it "
+                        f"(use `/admin enable_feature`).",
+                        ephemeral=True,
+                    )
+                    return
         removed = await db_enable_feature(self.bot, interaction.guild.id, feature, channel.id if channel else None)
         scope = "server-wide" if channel is None else f"in {channel.mention}"
         await interaction.response.send_message(
@@ -305,7 +319,20 @@ class GuildSettings(commands.Cog):
                 ephemeral=True,
             )
             return
-
+        # Opt-in commands can only be initially enabled by the bot owner.
+        base_cmd = command.split()[0] if command else command
+        if base_cmd in OPT_IN_COMMANDS:
+            async with self.bot.db.execute(
+                "SELECT 1 FROM enabled_commands WHERE guild_id = ? AND command_name = ?",
+                (interaction.guild.id, base_cmd),
+            ) as cursor:
+                if not await cursor.fetchone():
+                    await interaction.response.send_message(
+                        f"🔒 `/{command}` is an opt-in command — only the bot owner can enable it "
+                        f"(use `/admin enable_command`).",
+                        ephemeral=True,
+                    )
+                    return
         removed = await db_enable_command(self.bot, interaction.guild.id, command, channel.id if channel else None)
         scope = "server-wide" if channel is None else f"in {channel.mention}"
         await interaction.response.send_message(
