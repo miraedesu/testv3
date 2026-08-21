@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 import logging
 
 from common.constants import ATTACHMENTS_DIR, DB_PATH, DEV_GUILD_ID
-from common.command_toggles import is_command_disabled
-
+from common.command_toggles import is_command_disabled, enforce_opt_in_lockdown as enforce_command_opt_in
+from common.feature_toggles import enforce_opt_in_lockdown as enforce_feature_opt_in
 load_dotenv()
 
 # -------------------------------
@@ -68,7 +68,17 @@ class MyBot(commands.Bot):
         
         # Load the DB cog first so the enabled_cogs table exists
         await self.load_extension("cogs.db")
-        
+        # Enforce OPT-IN feature/command lockdown after guilds are available
+        import asyncio as _asyncio
+        async def _enforce_opt_ins():
+            await self.wait_until_ready()
+            try:
+                await enforce_feature_opt_in(self)
+                await enforce_command_opt_in(self)
+                logger.info("OPT-IN feature/command lockdown enforced.")
+            except Exception as e:
+                logger.error(f"Failed to enforce OPT-IN lockdown: {e}")
+        _asyncio.create_task(_enforce_opt_ins())
         # Fetch enabled cogs from the database
         async with self.db.execute("SELECT cog_name FROM enabled_cogs") as cursor:
             rows = await cursor.fetchall()
