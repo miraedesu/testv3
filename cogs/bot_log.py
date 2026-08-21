@@ -176,7 +176,8 @@ class BotLog(commands.Cog):
     async def on_message_delete(self, message: discord.Message):
         """Log when the bot's own messages (incl. embeds) are deleted.
         Skips messages the bot deleted itself (auto-cleanup).
-        Preserves the original embed structure and moves metadata to the footer."""
+        Preserves the original embed structure; metadata in proper fields
+        so mentions and timestamps actually render."""
         if message.author.id != self.bot.user.id:
             return
         if self._log_channel is None:
@@ -211,34 +212,48 @@ class BotLog(commands.Cog):
         if deleted_by is not None and deleted_by.id == self.bot.user.id:
             return
 
-        # Build metadata string for footer (moved to bottom for clean view)
-        if message.guild:
-            location = f"{message.guild.name} ({message.guild.id})"
-            channel_loc = message.channel.mention
-        else:
-            location = "DM"
-            channel_loc = "DM channel"
+        sent_ts = int(message.created_at.timestamp())
 
-        footer_parts = [
-            f"Msg ID: {message.id}",
-            f"Channel: {channel_loc}",
-            f"Location: {location}",
-            f"Sent: <t:{int(message.created_at.timestamp())}:F>",
-        ]
-        if deleted_by is not None:
-            footer_parts.append(f"Deleted by: {deleted_by} ({deleted_by.id})")
-
-        # Build the log embed — metadata in footer, text content in description
+        # Build the log embed with proper fields (renders mentions + timestamps)
         log_embed = discord.Embed(
             title="🗑️ Bot Message Deleted",
             color=discord.Color.red(),
             timestamp=discord.utils.utcnow(),
         )
-        log_embed.set_footer(text=" | ".join(footer_parts)[:2048])
 
+        # Channel as a clickable mention (only renders in fields, not footer)
+        if message.guild:
+            channel_value = f"{message.channel.mention} (`{message.channel.id}`)"
+            log_embed.add_field(
+                name="📍 Channel",
+                value=channel_value,
+                inline=False,
+            )
+        else:
+            log_embed.add_field(name="📍 Channel", value="DM channel", inline=False)
+
+        # Sent timestamp — renders as a live Discord timestamp in fields
+        log_embed.add_field(
+            name="🕒 Sent",
+            value=f"<t:{sent_ts}:F> (<t:{sent_ts}:R>)",
+            inline=False,
+        )
+
+        # Deleted by (only if known from audit log)
+        if deleted_by is not None:
+            log_embed.add_field(
+                name="👤 Deleted By",
+                value=f"{deleted_by.mention} (`{deleted_by.id}`)",
+                inline=False,
+            )
+
+        # Original text content in description (4096 char limit)
         if message.content:
             content = message.content if len(message.content) <= 4096 else message.content[:4093] + "..."
             log_embed.description = content
+
+        # Footer — just the message ID (the only thing that renders cleanly here)
+        log_embed.set_footer(text=f"Message ID: {message.id}")
 
         # Send log embed + original embeds preserved as-is (up to 9, 10 total max)
         embeds_to_send = [log_embed] + list(message.embeds[:9])
@@ -249,7 +264,6 @@ class BotLog(commands.Cog):
             logger.warning("[BotLog] Cannot send to log channel — check permissions.")
         except discord.HTTPException as e:
             logger.warning(f"[BotLog] HTTP error sending log: {e}")
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(BotLog(bot))

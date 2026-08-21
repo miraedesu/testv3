@@ -26,14 +26,13 @@ MAX_REMINDERS = 15
 # Discord timestamp format styles: (label, style_char)
 # Empty style_char → raw Unix timestamp (no formatting)
 TIMESTAMP_FORMATS: list[tuple[str, str]] = [
-    ("Short Time",        "t"),  # 8:47 PM
-    ("Long Time",         "T"),  # 8:47:00 PM
-    ("Short Date",        "d"),  # 08/05/2026
-    ("Long Date",         "D"),  # August 5th, 2026
-    ("Short Date/Time",   "f"),  # August 5th, 2026 8:47 PM
-    ("Long Date/Time",    "F"),  # Wednesday, August 5th, 2026 8:47 PM
-    ("Relative Time",     "R"),  # 52 seconds ago
-    ("Unix Timestamp",    ""),   # 1785955620 (raw, no formatting)
+    ("Short Time",        "t"),
+    ("Long Time",          "T"),
+    ("Short Date",        "d"),
+    ("Long Date",         "D"),
+    ("Short Date/Time",   "f"),
+    ("Long Date/Time",    "F"),
+    ("Relative Time",     "R"),
 ]
 # ---- /convert data ----
 
@@ -571,35 +570,52 @@ class Misc(commands.Cog):
     async def timezone_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete function for /setmytime."""
-        # 1. Search the country map first (case-insensitive)
-        country_matches = [
-            app_commands.Choice(name=f"{name} ({tz})", value=tz)
-            for name, tz in self.COUNTRY_TIMEZONE_MAP.items()
-            if current.lower() in name.lower() or current.lower() in tz.lower()
-        ]
+        """Autocomplete function for /setmytime and /time."""
+        results: list[app_commands.Choice[str]] = []
+        seen: set[str] = set()
+        cl = current.lower().strip()
 
-        # If we have 25 matches, return them (Discord limit)
-        if len(country_matches) >= 25:
-            return country_matches[:25]
+        # 1. GMT/UTC offset choices (GMT+0, GMT+5:30, GMT-8, etc.)
+        if not cl or "gmt" in cl or "utc" in cl or cl.startswith(("+", "-")) or cl.replace("-", "").replace("+", "").replace(":", "").isdigit():
+            for sign in ("+", "-"):
+                for h in range(0, 13):
+                    for m in (0, 30):
+                        if h == 0 and sign == "-":
+                            continue
+                        label = f"GMT{sign}{h}" if m == 0 else f"GMT{sign}{h}:{m:02d}"
+                        if not cl or cl in label.lower():
+                            if label not in seen:
+                                results.append(app_commands.Choice(name=label, value=label))
+                                seen.add(label)
+                        if len(results) >= 25:
+                            break
+                    if len(results) >= 25:
+                        break
+                if len(results) >= 25:
+                    break
 
-        # 2. Search the full IANA database for any remaining matches (e.g., specific cities)
+        if len(results) >= 25:
+            return results[:25]
+
+        # 2. Country map matches
+        for name, tz in self.COUNTRY_TIMEZONE_MAP.items():
+            if cl in name.lower() or cl in tz.lower():
+                if tz not in seen:
+                    results.append(app_commands.Choice(name=f"{name} ({tz})", value=tz))
+                    seen.add(tz)
+                if len(results) >= 25:
+                    return results[:25]
+
+        # 3. Full IANA database (excluding Etc/GMT since we cover those above)
         all_tz = zoneinfo.available_timezones()
-        iana_matches = [
-            app_commands.Choice(name=tz, value=tz)
-            for tz in all_tz
-            if current.lower() in tz.lower() and not tz.startswith("Etc/GMT")
-        ]
-        # Combine and return up to 25 unique results
-        seen = {choice.value for choice in country_matches}
-        for choice in iana_matches:
-            if choice.value not in seen:
-                country_matches.append(choice)
-                seen.add(choice.value)
-            if len(country_matches) >= 25:
-                break
+        for tz in all_tz:
+            if cl in tz.lower() and not tz.startswith("Etc/GMT") and tz not in seen:
+                results.append(app_commands.Choice(name=tz, value=tz))
+                seen.add(tz)
+                if len(results) >= 25:
+                    break
 
-        return country_matches[:25]
+        return results[:25]
 
     @app_commands.command(name="setmytime", description="Set your timezone for reminder parsing. Use 'none' to remove.")
     @app_commands.describe(timezone="Your timezone (start typing your country/city to see options)")
@@ -810,7 +826,6 @@ class Misc(commands.Cog):
                 preview = f"`{ts}` (raw unix — paste without backticks)"
             embed.add_field(name=name, value=f"{syntax}  →  {preview}", inline=False)
 
-        embed.set_footer(text=f"Unix: {ts}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
     # ============================================================
     #  REMINDER COMMANDS
@@ -855,22 +870,30 @@ class Misc(commands.Cog):
             minutes = random.randint(5, 60)
             trigger_dt = now + timedelta(minutes=minutes)
         else:
-            # Get user's timezone settings
-            user_tz = await get_user_timezone(self.bot.db, interaction.user.id)
-            parse_settings = DEFAULT_DATEPARSER_SETTINGS.copy()
-            if user_tz:
-                parse_settings['TIMEZONE'] = get_dateparser_tz_string(user_tz)
+            # Detect Discord timestamp syntax <t:1234567890:F> or a raw unix integer
+            ts_match = re.match(r'^<t:(\d+)(?::[tTdDfFR])?>$', when.strip())
+            if ts_match:
+                trigger_dt = datetime.fromtimestamp(int(ts_match.group(1)), tz=now.tzinfo)
+            elif when.strip().isdigit():
+                trigger_dt = datetime.fromtimestamp(int(when.strip()), tz=now.tzinfo)
+            else:
+                # Get user's timezone settings
+                user_tz = await get_user_timezone(self.bot.db, interaction.user.id)
+                parse_settings = DEFAULT_DATEPARSER_SETTINGS.copy()
+                if user_tz:
+                    parse_settings['TIMEZONE'] = get_dateparser_tz_string(user_tz)
 
-            # Parse the trigger time
-            trigger_dt = dateparser.parse(when, settings=parse_settings)
-            if not trigger_dt:
-                tz_hint = f" (Make sure it matches your timezone: `{user_tz}`)" if user_tz else "\n💡 *Tip: Use `/setmytime` to set your timezone for better accuracy.*"
-                await interaction.followup.send(
-                    f"❌ Could not understand the time `{when}`.{tz_hint}\n"
-                    "Try formats like `in 2 hours`, `tomorrow at 3pm`, or `soon`.",
-                    ephemeral=True,
-                )
-                return
+                # Parse the trigger time
+                trigger_dt = dateparser.parse(when, settings=parse_settings)
+                if not trigger_dt:
+                    tz_hint = f" (Make sure it matches your timezone: `{user_tz}`)" if user_tz else "\n💡 *Tip: Use `/setmytime` to set your timezone for better accuracy.*"
+                    await interaction.followup.send(
+                        f"❌ Could not understand the time `{when}`.{tz_hint}\n"
+                        "Try formats like `in 2 hours`, `tomorrow at 3pm`, `soon`, "
+                        "or paste a Discord timestamp like `<t:1750000000:F>`.",
+                        ephemeral=True,
+                    )
+                    return
 
         if trigger_dt <= now:
             await interaction.followup.send(

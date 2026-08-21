@@ -180,7 +180,7 @@ class Admin(commands.Cog):
         if guild is None:
             await interaction.response.send_message(f"Couldn't resolve a server matching `{server}`.", ephemeral=True)
             return
-        was_disabled = await enable_command(self.bot, guild.id, command, disabled_by="bot_owner")
+        was_disabled = await enable_command(self.bot, guild.id, command, disabled_by="bot_owner", enabled_by="bot_owner")
         if was_disabled:
             await interaction.response.send_message(f"Re-enabled `/{command}` in **{guild.name}** (`{guild.id}`).", ephemeral=True)
         else:
@@ -383,7 +383,7 @@ class Admin(commands.Cog):
         if not guild:
             await interaction.response.send_message("Server not found.", ephemeral=True)
             return
-        await enable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner")
+        await enable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner", enabled_by="bot_owner")
         await interaction.response.send_message(f"✅ Enabled {feature.name} in {guild.name}.", ephemeral=True)
         
     @admin_group.command(name="delete_name", description="Remove a specific name from a user's WhoIs history (bot owner only)")
