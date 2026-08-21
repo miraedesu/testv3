@@ -51,7 +51,15 @@ async def _ensure_disabled_by_column(bot):
         await bot.db.commit()
     except Exception:
         pass  # Column already exists
-
+async def _ensure_enabled_by_column(bot):
+    """Add enabled_by column to enabled_commands if it doesn't exist."""
+    try:
+        await bot.db.execute(
+            "ALTER TABLE enabled_commands ADD COLUMN enabled_by TEXT"
+        )
+        await bot.db.commit()
+    except Exception:
+        pass  # Column already exists
 async def disable_command(
     bot: commands.Bot,
     guild_id: int,
@@ -73,24 +81,26 @@ async def enable_command(
     command_name: str,
     channel_id: int | None = None,
     disabled_by: str = "guild_admin",
+    enabled_by: str = "guild_admin",
 ) -> bool:
     """Removes the matching disable row (only rows set by the same source)
     and writes an enabled_commands entry.
     Returns True if a disable row was actually removed."""
     await _ensure_disabled_by_column(bot)
+    await _ensure_enabled_by_column(bot)
     cursor = await bot.db.execute(
         "DELETE FROM disabled_commands "
         "WHERE guild_id = ? AND command_name = ? AND channel_id IS ? AND disabled_by = ?",
         (guild_id, command_name, channel_id, disabled_by),
     )
     await bot.db.execute(
-        "INSERT OR IGNORE INTO enabled_commands (guild_id, command_name) "
-        "VALUES (?, ?)",
-        (guild_id, command_name),
+        "INSERT INTO enabled_commands (guild_id, command_name, enabled_by) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id, command_name) DO UPDATE SET enabled_by = excluded.enabled_by",
+        (guild_id, command_name, enabled_by),
     )
     await bot.db.commit()
     return cursor.rowcount > 0
-
 async def list_disabled_commands(
     bot: commands.Bot,
     guild_id: int,
@@ -104,3 +114,37 @@ async def list_disabled_commands(
     ) as cursor:
         rows = await cursor.fetchall()
     return [(name, ch_id, source) for name, ch_id, source in rows]
+
+async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
+    """On startup, ensure opt-in commands obey the code config.
+    1. Wipe enabled_commands rows for opt-in commands that weren't bot-owner-enabled.
+    2. Write a bot_owner-locked disabled_commands row for any opt-in command
+       that is not currently enabled."""
+    await _ensure_disabled_by_column(bot)
+    await _ensure_enabled_by_column(bot)
+
+    if OPT_IN_COMMANDS:
+        placeholders = ",".join("?" for _ in OPT_IN_COMMANDS)
+        await bot.db.execute(
+            f"DELETE FROM enabled_commands "
+            f"WHERE command_name IN ({placeholders}) "
+            f"AND (enabled_by IS NULL OR enabled_by != 'bot_owner')",
+            tuple(OPT_IN_COMMANDS),
+        )
+
+    for guild in bot.guilds:
+        async with bot.db.execute(
+            "SELECT command_name FROM enabled_commands WHERE guild_id = ?",
+            (guild.id,),
+        ) as cursor:
+            enabled = {row[0] for row in await cursor.fetchall()}
+
+        for command in OPT_IN_COMMANDS:
+            if command not in enabled:
+                await bot.db.execute(
+                    "INSERT OR IGNORE INTO disabled_commands "
+                    "(guild_id, command_name, channel_id, disabled_by) VALUES (?, ?, NULL, 'bot_owner')",
+                    (guild.id, command),
+                )
+
+    await bot.db.commit()

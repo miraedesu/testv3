@@ -72,7 +72,15 @@ async def _ensure_disabled_by_column(bot):
         await bot.db.commit()
     except Exception:
         pass  # Column already exists
-
+async def _ensure_enabled_by_column(bot):
+    """Add enabled_by column to enabled_features if it doesn't exist."""
+    try:
+        await bot.db.execute(
+            "ALTER TABLE enabled_features ADD COLUMN enabled_by TEXT"
+        )
+        await bot.db.commit()
+    except Exception:
+        pass  # Column already exists
 async def disable_feature(
     bot: commands.Bot,
     guild_id: int,
@@ -95,23 +103,25 @@ async def enable_feature(
     feature_name: str,
     channel_id: int | None = None,
     disabled_by: str = "guild_admin",
+    enabled_by: str = "guild_admin",
 ) -> bool:
     """Removes the disable row (only rows set by the same source).
     Returns True if a disable row was actually removed."""
     await _ensure_disabled_by_column(bot)
+    await _ensure_enabled_by_column(bot)
     cursor = await bot.db.execute(
         "DELETE FROM disabled_features "
         "WHERE guild_id = ? AND feature_name = ? AND channel_id IS ? AND disabled_by = ?",
         (guild_id, feature_name, channel_id, disabled_by),
     )
     await bot.db.execute(
-        "INSERT OR IGNORE INTO enabled_features (guild_id, feature_name) "
-        "VALUES (?, ?)",
-        (guild_id, feature_name),
+        "INSERT INTO enabled_features (guild_id, feature_name, enabled_by) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id, feature_name) DO UPDATE SET enabled_by = excluded.enabled_by",
+        (guild_id, feature_name, enabled_by),
     )
     await bot.db.commit()
     return cursor.rowcount > 0
-
 
 async def list_disabled_features(
     bot: commands.Bot,
@@ -126,3 +136,40 @@ async def list_disabled_features(
     ) as cursor:
         rows = await cursor.fetchall()
     return [(name, ch_id, source) for name, ch_id, source in rows]
+
+async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
+    """On startup, ensure opt-in features obey the code config.
+    1. Wipe enabled_features rows for opt-in features that weren't bot-owner-enabled
+       (cleans up falsely-enabled rows from before OPT_IN enforcement existed).
+    2. Write a bot_owner-locked disabled_features row for any opt-in feature that
+       is not currently enabled — blocks guild admins from enabling it."""
+    await _ensure_disabled_by_column(bot)
+    await _ensure_enabled_by_column(bot)
+
+    # 1. Wipe falsely-enabled opt-in rows (enabled_by is NULL or != 'bot_owner')
+    if OPT_IN_FEATURES:
+        placeholders = ",".join("?" for _ in OPT_IN_FEATURES)
+        await bot.db.execute(
+            f"DELETE FROM enabled_features "
+            f"WHERE feature_name IN ({placeholders}) "
+            f"AND (enabled_by IS NULL OR enabled_by != 'bot_owner')",
+            tuple(OPT_IN_FEATURES),
+        )
+
+    # 2. Lock down opt-in features not in enabled_features for every guild
+    for guild in bot.guilds:
+        async with bot.db.execute(
+            "SELECT feature_name FROM enabled_features WHERE guild_id = ?",
+            (guild.id,),
+        ) as cursor:
+            enabled = {row[0] for row in await cursor.fetchall()}
+
+        for feature in OPT_IN_FEATURES:
+            if feature not in enabled:
+                await bot.db.execute(
+                    "INSERT OR IGNORE INTO disabled_features "
+                    "(guild_id, feature_name, channel_id, disabled_by) VALUES (?, ?, NULL, 'bot_owner')",
+                    (guild.id, feature),
+                )
+
+    await bot.db.commit()
