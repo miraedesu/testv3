@@ -8,6 +8,7 @@ import os
 import discord
 from discord.ext import commands
 import logging
+import re
 
 from common.constants import bannedimg, friendly_permission_name, kickimg, leaveimg
 from common.settings_store import get_log_channel
@@ -19,9 +20,66 @@ from common.feature_toggles import is_feature_disabled
 # boost/unboost event doesn't get logged twice by two different handlers
 # that both react to the same underlying change.
 logger = logging.getLogger(__name__)
-class BoostAttributionModal(discord.ui.Modal, title="Attribute Boost Change"):
+import re
+
+def _parse_booster_id(text: str, guild: discord.Guild) -> int | None:
+    """Resolve a user ID from a mention, raw ID, or guild nickname/username."""
+    text = text.strip()
+    m = re.match(r'^<@!?(\d+)>$', text)
+    if m:
+        return int(m.group(1))
+    if text.isdigit():
+        return int(text)
+    member = guild.get_member_named(text)
+    return member.id if member else None
+
+
+async def apply_boost_attribution(
+    bot, message: discord.Message, user_id: int, admin: discord.User, guild: discord.Guild,
+) -> bool:
+    """Transform a 'Boost Count Changed' embed into a 'Boost Removed' embed,
+    remove the attribution button, and decrement the user's boost_list entry
+    if they're in it. Returns True on success."""
+    member = guild.get_member(user_id)
+
+    embed = discord.Embed(
+        title="<:boostremove:1534198057036419214> Boost Removed",
+        description=(
+            f"{member.mention} is no longer "
+            f"boosting the server."
+        ),
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow(),
+    )
+    if member:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(
+        name="User",
+        value=f"{member} (`{user_id}`)" if member else f"`{user_id}` (not in server)",
+        inline=False,
+    )
+    embed.add_field(name="Edited by", value=admin.mention, inline=False)
+    embed.set_footer(
+        text=f"Total boosts: {guild.premium_subscription_count} • Level {guild.premium_tier}"
+    )
+
+    try:
+        await message.edit(embed=embed, view=None)
+    except (discord.NotFound, discord.Forbidden):
+        return False
+
+    # Decrement boost_list entry if the user is tracked
+    try:
+        from cogs.boost_list import decrement_boost_count
+        await decrement_boost_count(bot, guild.id, user_id)
+    except ImportError:
+        pass
+    return True
+
+
+class BoostAttributionModal(discord.ui.Modal, title="Attribute Boost Removal"):
     booster_name = discord.ui.TextInput(
-        label="Who was it? (username, user ID, or @mention)",
+        label="Who unboosted? (user ID, @mention, or name)",
         placeholder="e.g. @john, john, or 123456789012345678",
         required=True,
         max_length=100,
@@ -33,41 +91,33 @@ class BoostAttributionModal(discord.ui.Modal, title="Attribute Boost Change"):
         self.admin = admin
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            embed = self.embed_message.embeds[0]
-        except IndexError:
+        user_id = _parse_booster_id(self.booster_name.value, interaction.guild)
+        if user_id is None:
             await interaction.response.send_message(
-                "❌ Could not find the original embed — it may have been deleted.",
+                f"❌ Couldn't resolve `{self.booster_name.value}` to a user. "
+                f"Try a user ID, @mention, or exact username.",
                 ephemeral=True,
             )
             return
 
-        embed.fields = [f for f in embed.fields if f.name != "Attributed to"]
-        embed.add_field(
-            name="Attributed to",
-            value=f"**{self.booster_name.value}**\n(by {self.admin.mention})",
-            inline=False,
+        ok = await apply_boost_attribution(
+            interaction.client, self.embed_message, user_id,
+            self.admin, interaction.guild,
         )
-        embed.color = discord.Color.orange()
-
-        try:
-            await self.embed_message.edit(embed=embed)
-        except (discord.NotFound, discord.Forbidden):
+        if ok:
+            await interaction.response.send_message(
+                f"✅ Boost removal attributed to <@{user_id}>. "
+                f"Embed updated and boost_list adjusted.",
+                ephemeral=True,
+            )
+        else:
             await interaction.response.send_message(
                 "❌ Could not edit the original message — it may be deleted or I lack permissions.",
                 ephemeral=True,
             )
-            return
-
-        await interaction.response.send_message(
-            f"✅ Attributed to **{self.booster_name.value}**.",
-            ephemeral=True,
-        )
-
-
 class BoostAttributionView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # Persistent — survives restarts
+        super().__init__(timeout=None)  # Persistent — no expiry
 
     @discord.ui.button(
         label="I know who it was",
@@ -77,7 +127,6 @@ class BoostAttributionView(discord.ui.View):
     async def attribute_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        # Only allow admins/staff to attribute
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message(
                 "❌ Only server admins can attribute boost removals.",
@@ -90,7 +139,6 @@ class BoostAttributionView(discord.ui.View):
             admin=interaction.user,
         )
         await interaction.response.send_modal(modal)
-
 def diff_permissions(before: discord.Permissions, after: discord.Permissions) -> tuple[list[str], list[str]]:
     """Returns (granted, revoked) permission names between two Permissions."""
     before_perms = dict(before)
@@ -438,65 +486,7 @@ class MemberEvents(commands.Cog):
         try:
             await boost_log_channel.send(embed=boost_embed)
         except discord.Forbidden:
-            logger.info(f"Permission Denied: Cannot send logs to #{boost_log_channel.name}")
-    #--- Remove after Simulation--- >         
-    async def _process_boost_event(
-        self, guild: discord.Guild, member: discord.Member, started_boosting: bool
-    ) -> None:
-        """Core boost event processing — called by on_member_update and the
-        /admin simulate_boost / simulate_unboost commands.
-
-        Handles: guild_boosts dedup table + server-log embed.
-        Boost list is managed manually via /boost_list commands only."""
-        if await is_feature_disabled(self.bot, guild.id, "boost_tracker"):
-            return
-
-        # 1. guild_boosts dedup table
-        if started_boosting:
-            cursor = await self.bot.db.execute(
-                "INSERT OR IGNORE INTO guild_boosts "
-                "(guild_id, user_id, started_at) VALUES (?, ?, ?)",
-                (guild.id, member.id, int(discord.utils.utcnow().timestamp())),
-            )
-            await self.bot.db.commit()
-            if cursor.rowcount == 0:
-                return
-        else:
-            cursor = await self.bot.db.execute(
-                "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
-                (guild.id, member.id),
-            )
-            await self.bot.db.commit()
-            if cursor.rowcount == 0:
-                return
-
-        # 2. Post embed to server-log
-        server_log_channel = await get_log_channel(self.bot, guild.id, "server-log")
-        if server_log_channel is not None:
-            if started_boosting:
-                embed = discord.Embed(
-                    title="<:newboost:1534195815671660685> New Server Boost",
-                    description=f"{member.mention} just boosted the server!",
-                    color=discord.Color.blue(),
-                    timestamp=discord.utils.utcnow(),
-                )
-            else:
-                embed = discord.Embed(
-                    title="<:boostremove:1534198057036419214> Boost Removed",
-                    description=f"{member.mention} is no longer boosting the server.",
-                    color=discord.Color.red(),
-                    timestamp=discord.utils.utcnow(),
-                )
-            embed.set_thumbnail(url=member.display_avatar.url)
-            embed.add_field(name="User", value=f"{member} (`{member.id}`)", inline=False)
-            embed.set_footer(
-                text=f"Total boosts: {guild.premium_subscription_count} • Level {guild.premium_tier}"
-            )
-            try:
-                await server_log_channel.send(embed=embed)
-            except discord.Forbidden:
-                pass
-    #--- Remove after Simulation--- ^           
+            logger.info(f"Permission Denied: Cannot send logs to #{boost_log_channel.name}")      
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         # --- Username change logging & DB tracking ---
@@ -603,112 +593,109 @@ class MemberEvents(commands.Cog):
 
         if not (started_boosting or stopped_boosting):
             return
-        #--- Remove after Simulation--->
-        await self._process_boost_event(after.guild, after, started_boosting)
-        #--- Remove after Simulation---^
-        # if started_boosting:
-        #     # INSERT OR IGNORE → rowcount == 0 means already tracked (double event)
-        #     try:
-        #         cursor = await self.bot.db.execute(
-        #             "INSERT OR IGNORE INTO guild_boosts "
-        #             "(guild_id, user_id, started_at) VALUES (?, ?, ?)",
-        #             (after.guild.id, after.id, int(after.premium_since.timestamp())),
-        #         )
-        #         await self.bot.db.commit()
-        #         if cursor.rowcount == 0:
-        #             return  # Prevent double log
-        #     except Exception as e:
-        #         logger.error(f"[MemberEvents] Error tracking boost start: {e}")
-        #         return
-        # else:  # stopped_boosting
-        #     try:
-        #         cursor = await self.bot.db.execute(
-        #             "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
-        #             (after.guild.id, after.id),
-        #         )
-        #         await self.bot.db.commit()
-        #         if cursor.rowcount == 0:
-        #             return  # Prevent double log
-        #     except Exception as e:
-        #         logger.error(f"[MemberEvents] Error tracking boost stop: {e}")
-        #         return
+        if started_boosting:
+            # INSERT OR IGNORE → rowcount == 0 means already tracked (double event)
+            try:
+                cursor = await self.bot.db.execute(
+                    "INSERT OR IGNORE INTO guild_boosts "
+                    "(guild_id, user_id, started_at) VALUES (?, ?, ?)",
+                    (after.guild.id, after.id, int(after.premium_since.timestamp())),
+                )
+                await self.bot.db.commit()
+                if cursor.rowcount == 0:
+                    return  # Prevent double log
+            except Exception as e:
+                logger.error(f"[MemberEvents] Error tracking boost start: {e}")
+                return
+        else:  # stopped_boosting
+            try:
+                cursor = await self.bot.db.execute(
+                    "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
+                    (after.guild.id, after.id),
+                )
+                await self.bot.db.commit()
+                if cursor.rowcount == 0:
+                    return  # Prevent double log
+            except Exception as e:
+                logger.error(f"[MemberEvents] Error tracking boost stop: {e}")
+                return
 
-        # server_log_channel = await get_log_channel(self.bot, after.guild.id, "server-log")
-        # if server_log_channel is None:
-        #     return
+        server_log_channel = await get_log_channel(self.bot, after.guild.id, "server-log")
+        if server_log_channel is None:
+            return
 
-        # if started_boosting:
-        #     embed = discord.Embed(
-        #         title="<:newboost:1534195815671660685> New Server Boost",
-        #         description=f"{after.mention} just boosted the server!",
-        #         color=discord.Color.blue(),
-        #         timestamp=discord.utils.utcnow(),
-        #     )
-        # else:
-        #     embed = discord.Embed(
-        #         title="<:boostremove:1534198057036419214> Boost Removed",
-        #         description=f"{after.mention} is no longer boosting the server.",
-        #         color=discord.Color.red(),
-        #         timestamp=discord.utils.utcnow(),
-        #     )
+        if started_boosting:
+            embed = discord.Embed(
+                title="<:newboost:1534195815671660685> New Server Boost",
+                description=f"{after.mention} just boosted the server!",
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow(),
+            )
+        else:
+            embed = discord.Embed(
+                title="<:boostremove:1534198057036419214> Boost Removed",
+                description=f"{after.mention} is no longer boosting the server.",
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow(),
+            )
 
-        # embed.set_thumbnail(url=after.display_avatar.url)
-        # embed.add_field(name="User", value=f"{after} (`{after.id}`)", inline=False)
-        # embed.set_footer(
-        #     text=f"Total boosts: {after.guild.premium_subscription_count} • Level {after.guild.premium_tier}"
-        # )
+        embed.set_thumbnail(url=after.display_avatar.url)
+        embed.add_field(name="User", value=f"{after} (`{after.id}`)", inline=False)
+        embed.set_footer(
+            text=f"Total boosts: {after.guild.premium_subscription_count} • Level {after.guild.premium_tier}"
+        )
 
-        # try:
-        #     await server_log_channel.send(embed=embed)
-        # except discord.Forbidden:
-        #     logger.info(f"Permission Denied: Cannot send logs to #{server_log_channel.name}")
+        try:
+            await server_log_channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.info(f"Permission Denied: Cannot send logs to #{server_log_channel.name}")
 
-        # # --- Boost list auto-update (only if boost_list cog is installed) ---
-        # # Increment/decrement the existing entry's count. If a NEW booster
-        # # isn't in the list yet, post an attribution embed with an
-        # # "I know who it was" button so the admin can add them with defaults.
-        # try:
-        #     from cogs.boost_list import (
-        #         increment_boost_count,
-        #         decrement_boost_count,
-        #         BoostListAddView,
-        #     )
-        #     boost_list_installed = True
-        # except ImportError:
-        #     boost_list_installed = False
+        # --- Boost list auto-update (only if boost_list cog is installed) ---
+        # Increment/decrement the existing entry's count. If a NEW booster
+        # isn't in the list yet, post an attribution embed with an
+        # "I know who it was" button so the admin can add them with defaults.
+        try:
+            from cogs.boost_list import (
+                increment_boost_count,
+                decrement_boost_count,
+                BoostListAddView,
+            )
+            boost_list_installed = True
+        except ImportError:
+            boost_list_installed = False
 
-        # attribution_pending = False
-        # if boost_list_installed:
-        #     if started_boosting:
-        #         if not await increment_boost_count(self.bot, after.guild.id, after.id):
-        #             attribution_pending = True
-        #     else:  # stopped_boosting
-        #         await decrement_boost_count(self.bot, after.guild.id, after.id)
+        attribution_pending = False
+        if boost_list_installed:
+            if started_boosting:
+                if not await increment_boost_count(self.bot, after.guild.id, after.id):
+                    attribution_pending = True
+            else:  # stopped_boosting
+                await decrement_boost_count(self.bot, after.guild.id, after.id)
 
-        # if attribution_pending and server_log_channel is not None:
-        #     attr_embed = discord.Embed(
-        #         title="<:boost:1534195799892955176> Boost List Update Needed",
-        #         description=(
-        #             f"{after.mention} just boosted but isn't in the boost_list yet.\n"
-        #             f"Click **I know who it was** below to add them with default "
-        #             f"settings (1 boost, deadline = next annual anniversary)."
-        #         ),
-        #         color=discord.Color.gold(),
-        #         timestamp=discord.utils.utcnow(),
-        #     )
-        #     attr_embed.add_field(
-        #         name="User", value=f"{after} (`{after.id}`)", inline=False
-        #     )
-        #     attr_embed.set_thumbnail(url=after.display_avatar.url)
-        #     # Footer is read by the persistent view's click handler to know
-        #     # which user to add. Format MUST be "User ID: <id>".
-        #     attr_embed.set_footer(text=f"User ID: {after.id}")
-        #     try:
-        #         await server_log_channel.send(
-        #             embed=attr_embed, view=BoostListAddView()
-        #         )
-        #     except discord.Forbidden:
-        #         pass
+        if attribution_pending and server_log_channel is not None:
+            attr_embed = discord.Embed(
+                title="<:boost:1534195799892955176> Boost List Update Needed",
+                description=(
+                    f"{after.mention} just boosted but isn't in the boost_list yet.\n"
+                    f"Click **I know who it was** below to add them with default "
+                    f"settings (1 boost, deadline = next annual anniversary)."
+                ),
+                color=discord.Color.gold(),
+                timestamp=discord.utils.utcnow(),
+            )
+            attr_embed.add_field(
+                name="User", value=f"{after} (`{after.id}`)", inline=False
+            )
+            attr_embed.set_thumbnail(url=after.display_avatar.url)
+            # Footer is read by the persistent view's click handler to know
+            # which user to add. Format MUST be "User ID: <id>".
+            attr_embed.set_footer(text=f"User ID: {after.id}")
+            try:
+                await server_log_channel.send(
+                    embed=attr_embed, view=BoostListAddView()
+                )
+            except discord.Forbidden:
+                pass
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Track joins for the whois command."""
@@ -1042,14 +1029,36 @@ class MemberEvents(commands.Cog):
         # Either increase drift (couldn't identify new boosters) or
         # decrease drift with no stale rows identified — fall back to the
         # generic count-changed message with the attribution button.
+        await self._post_boost_drift_embed(
+            after,
+            before.premium_subscription_count,
+            after.premium_subscription_count,
+            db_count,
+            tier_changed=tier_changed,
+            before_tier=before.premium_tier,
+        )
+
+    async def _post_boost_drift_embed(
+        self,
+        guild: discord.Guild,
+        before_count: int,
+        after_count: int,
+        db_count: int,
+        tier_changed: bool = False,
+        before_tier: int = 0,
+    ) -> None:
+        """Post the 'Boost Count Changed' drift embed with the attribution
+        button. Used by on_guild_update and the simulate_boost_drift command."""
+        log_channel = await get_log_channel(self.bot, guild.id, "server-log")
         if log_channel is None:
             return
 
+        diff = after_count - before_count
         embed = discord.Embed(
             title="<:boost:1534195799892955176> Boost Count Changed",
             description=(
-                f"Boost count went from **{before.premium_subscription_count}** "
-                f"to **{after.premium_subscription_count}** "
+                f"Boost count went from **{before_count}** "
+                f"to **{after_count}** "
                 f"({'+' if diff > 0 else ''}{diff}).\n"
                 f"⚠️ DB-tracked boosters ({db_count}) don't match the live "
                 f"count — this will be reconciled on next sync."
@@ -1060,10 +1069,10 @@ class MemberEvents(commands.Cog):
         if tier_changed:
             embed.add_field(
                 name="Tier Changed",
-                value=f"Level {before.premium_tier} → Level {after.premium_tier}",
+                value=f"Level {before_tier} → Level {guild.premium_tier}",
                 inline=False,
             )
-        embed.set_footer(text=f"Level {after.premium_tier}")
+        embed.set_footer(text=f"Level {guild.premium_tier}")
         try:
             await log_channel.send(embed=embed, view=BoostAttributionView())
         except discord.Forbidden:

@@ -57,6 +57,7 @@ def calculate_next_deadline(boost_since_ts: int, now_ts: int | None = None) -> i
 
 async def _post_reminder(
     bot, guild_id: int, booster_id: int, deadline_ts: int, days_label: str,
+    boost_since_ts: int = 0, boost_count: int = 1,
 ) -> bool:
     """Post a deadline reminder to the guild's server-log channel.
     Pings the guild's configured boost_list_mention user if set, but always
@@ -76,14 +77,29 @@ async def _post_reminder(
     else:
         ping_content = None
 
+    guild = bot.get_guild(guild_id)
+    member = guild.get_member(booster_id) if guild else None
+
     embed = discord.Embed(
         title=f"<:newboost:1534195815671660685> Boost Expiring in — {days_label}",
         description=(
-            f"<@{booster_id}> server boost is expiring"
+            f"<@{booster_id}>'s server boost is expiring "
             f"in **{days_label}** (<t:{deadline_ts}:F>)."
         ),
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
+    )
+    if member:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    if boost_since_ts:
+        embed.add_field(
+            name="Boosting Since", value=f"<t:{boost_since_ts}:F>", inline=True
+        )
+    embed.add_field(
+        name="Total Boosts", value=f"**{boost_count}**", inline=True
+    )
+    embed.add_field(
+        name="Expiring", value=f"<t:{deadline_ts}:R>", inline=True
     )
     embed.set_footer(text=f"Booster ID: {booster_id}")
     try:
@@ -95,7 +111,6 @@ async def _post_reminder(
             f"server-log in guild {guild_id}: {e}"
         )
         return False
-
 
 # ── Boost list mutation helpers (used by both this cog and member_events) ──
 
@@ -350,14 +365,18 @@ class BoostList(commands.Cog):
         three_day_cutoff = now_ts + 3 * 86400
 
         async with self.bot.db.execute(
-            "SELECT entry_num, guild_id, user_id, deadline FROM boost_list "
+            "SELECT entry_num, guild_id, user_id, deadline, boost_since, boost_count "
+            "FROM boost_list "
             "WHERE deadline <= ? AND deadline > ? AND week_notified = 0",
             (week_cutoff, now_ts),
         ) as cursor:
             due_week = await cursor.fetchall()
 
-        for entry_num, guild_id, user_id, deadline_ts in due_week:
-            posted = await _post_reminder(self.bot, guild_id, user_id, deadline_ts, "1 week")
+        for entry_num, guild_id, user_id, deadline_ts, boost_since, boost_count in due_week:
+            posted = await _post_reminder(
+                self.bot, guild_id, user_id, deadline_ts, "1 week",
+                boost_since_ts=boost_since, boost_count=boost_count,
+            )
             if posted:
                 await self.bot.db.execute(
                     "UPDATE boost_list SET week_notified = 1 "
@@ -367,14 +386,18 @@ class BoostList(commands.Cog):
                 await self.bot.db.commit()
 
         async with self.bot.db.execute(
-            "SELECT entry_num, guild_id, user_id, deadline FROM boost_list "
+            "SELECT entry_num, guild_id, user_id, deadline, boost_since, boost_count "
+            "FROM boost_list "
             "WHERE deadline <= ? AND deadline > ? AND three_day_notified = 0",
             (three_day_cutoff, now_ts),
         ) as cursor:
             due_3day = await cursor.fetchall()
 
-        for entry_num, guild_id, user_id, deadline_ts in due_3day:
-            posted = await _post_reminder(self.bot, guild_id, user_id, deadline_ts, "3 days")
+        for entry_num, guild_id, user_id, deadline_ts, boost_since, boost_count in due_3day:
+            posted = await _post_reminder(
+                self.bot, guild_id, user_id, deadline_ts, "3 days",
+                boost_since_ts=boost_since, boost_count=boost_count,
+            )
             if posted:
                 await self.bot.db.execute(
                     "UPDATE boost_list SET three_day_notified = 1 "
@@ -382,7 +405,6 @@ class BoostList(commands.Cog):
                     (guild_id, entry_num),
                 )
                 await self.bot.db.commit()
-
     @tasks.loop(hours=1)
     async def refresh_deadlines(self):
         now_ts = int(discord.utils.utcnow().timestamp())

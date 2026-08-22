@@ -274,6 +274,55 @@ class GuildSettings(commands.Cog):
             "✅ Boost mention user cleared. Reminders will be skipped until set.",
             ephemeral=True,
         )
+    @group.command(name="boost_edit", description="Attribute a 'Boost Count Changed' embed to a user (alternative to the button)")
+    @app_commands.describe(
+        message_id="Message ID of the Boost Count Changed embed in server-log",
+        user="User who removed their boost",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def boost_edit(
+        self, interaction: discord.Interaction, message_id: str, user: discord.User,
+    ):
+        from common.settings_store import get_log_channel
+        from cogs.member_events import apply_boost_attribution
+
+        log_channel = await get_log_channel(self.bot, interaction.guild.id, "server-log")
+        if log_channel is None:
+            await interaction.response.send_message(
+                "❌ No server-log channel set for this guild.", ephemeral=True
+            )
+            return
+
+        try:
+            msg = await log_channel.fetch_message(int(message_id))
+        except (ValueError, discord.NotFound, discord.HTTPException):
+            await interaction.response.send_message(
+                "❌ Message not found in server-log.", ephemeral=True
+            )
+            return
+
+        if not msg.embeds or "Boost Count Changed" not in (msg.embeds[0].title or ""):
+            await interaction.response.send_message(
+                "❌ That message doesn't look like a boost drift embed.",
+                ephemeral=True,
+            )
+            return
+
+        ok = await apply_boost_attribution(
+            self.bot, msg, user.id, interaction.user, interaction.guild,
+        )
+        if ok:
+            await interaction.response.send_message(
+                f"✅ Attributed boost removal to {user.mention}. "
+                f"Embed updated and boost_list adjusted (if they were tracked).",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "❌ Could not edit the message — it may be deleted or I lack permissions.",
+                ephemeral=True,
+            )
     # ── disable_feature / enable_feature ────────────────────────────
     @group.command(name="disable_feature", description="Disable a feature for #channel or the whole server")
     @app_commands.describe(
