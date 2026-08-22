@@ -49,7 +49,7 @@ OPT_IN_COMMANDS = {
     "whois",
     "whois_add",
     "whois_del",
-    "whois_list"
+    "whois_list",
     "cr",
     "emote",
     "guild_settings boost_edit",
