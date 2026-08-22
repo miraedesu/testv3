@@ -90,7 +90,7 @@ class MyBot(commands.Bot):
             cogs_to_load = [
                 "cogs.reactions", "cogs.settings", "cogs.welcome", "cogs.emotes",
                 "cogs.moderation", "cogs.member_events", "cogs.permcheck", "cogs.admin",
-                "cogs.anime", "cogs.profile", "cogs.whois", "cogs.misc", "cogs.guild_settings", "cogs.bot_log",
+                "cogs.anime", "cogs.profile", "cogs.whois", "cogs.misc", "cogs.guild_settings", "cogs.bot_log","cogs.boost_list",
             ]
             # Save defaults to DB
             await self.db.executemany("INSERT OR IGNORE INTO enabled_cogs (cog_name) VALUES (?)", [(c,) for c in cogs_to_load])
