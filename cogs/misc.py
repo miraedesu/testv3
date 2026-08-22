@@ -567,6 +567,58 @@ class Misc(commands.Cog):
         "Zambia": "Africa/Lusaka", "Zimbabwe": "Africa/Harare"
     }
 
+    # Precomputed list of every real-world GMT/UTC offset
+    # (sign, hours, minutes, label_suffix, observes_dst).
+    # Only includes offsets actually used by some territory —
+    # no synthetic zones like GMT+0:30.
+    #
+    # DST-free zones are accurate year-round.
+    # DST-observing zones are only correct during that region's standard time;
+    # they will be off by 1 hour during summer. Users who need DST awareness
+    # should pick the IANA zone (e.g. America/New_York) from the country list.
+    _REAL_GMT_OFFSETS: list[tuple[str, int, int, str, bool]] = [
+        # ---- DST-free offsets (safe year-round) ----
+        ("-", 12, 0,  "Baker Island",                False),
+        ("-", 11, 0,  "American Samoa",              False),
+        ("-", 10, 0,  "Hawaii",                       False),
+        ("-",  9, 30, "Marquesas Islands",            False),
+        ("-",  2, 0,  "South Georgia",                False),
+        ("+",  0, 0,  "UTC / GMT (Iceland)",          False),
+        ("+",  3, 0,  "Moscow / East Africa",         False),
+        ("+",  3, 30, "Iran",                         False),
+        ("+",  4, 0,  "Gulf / Armenia",               False),
+        ("+",  4, 30, "Afghanistan",                  False),
+        ("+",  5, 0,  "Pakistan / Maldives",           False),
+        ("+",  5, 30, "India / Sri Lanka",             False),
+        ("+",  5, 45, "Nepal",                        False),
+        ("+",  6, 0,  "Bangladesh / Bhutan",          False),
+        ("+",  6, 30, "Myanmar / Cocos",               False),
+        ("+",  7, 0,  "Indochina / Indonesia West",    False),
+        ("+",  8, 0,  "China / Singapore / Philippines", False),
+        ("+",  8, 45, "Eucla (Western Australia)",     False),
+        ("+",  9, 0,  "Japan / Korea",                 False),
+        ("+", 11, 0, "Solomon Islands",               False),
+        ("+", 14, 0, "Line Islands (Kiribati)",       False),
+        # ---- DST-observing offsets (correct only during standard time) ----
+        ("-",  9, 0,  "Alaska",                       True),
+        ("-",  8, 0,  "Pacific Time (US/Canada)",      True),
+        ("-",  7, 0,  "Mountain Time (US/Canada)",     True),
+        ("-",  6, 0,  "Central Time (US/Canada)",      True),
+        ("-",  5, 0,  "Eastern Time (US/Canada)",      True),
+        ("-",  4, 0,  "Atlantic (Canada/Caribbean)",   True),
+        ("-",  3, 30, "Newfoundland",                 True),
+        ("-",  3, 0,  "Brazil / Argentina",           True),
+        ("-",  1, 0,  "Azores / Cape Verde",           True),
+        ("+",  1, 0,  "Central Europe (CET)",          True),
+        ("+",  2, 0,  "Eastern Europe (EET)",          True),
+        ("+",  9, 30, "Australia Central",            True),
+        ("+", 10, 0,  "Australia Eastern",            True),
+        ("+", 10, 30, "Lord Howe Island",              True),
+        ("+", 12, 0,  "New Zealand / Fiji",            True),
+        ("+", 12, 45, "Chatham Islands",               True),
+        ("+", 13, 0,  "Samoa / Tonga",                 True),
+    ]
+
     async def timezone_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
@@ -575,24 +627,29 @@ class Misc(commands.Cog):
         seen: set[str] = set()
         cl = current.lower().strip()
 
-        # 1. GMT/UTC offset choices (GMT+0, GMT+5:30, GMT-8, etc.)
-        if not cl or "gmt" in cl or "utc" in cl or cl.startswith(("+", "-")) or cl.replace("-", "").replace("+", "").replace(":", "").isdigit():
-            for sign in ("+", "-"):
-                for h in range(0, 13):
-                    for m in (0, 30):
-                        if h == 0 and sign == "-":
-                            continue
-                        label = f"GMT{sign}{h}" if m == 0 else f"GMT{sign}{h}:{m:02d}"
-                        if not cl or cl in label.lower():
-                            if label not in seen:
-                                results.append(app_commands.Choice(name=label, value=label))
-                                seen.add(label)
-                        if len(results) >= 25:
-                            break
+        # 1. Real GMT/UTC offset choices.
+        # DST-free offsets are shown first (False < True when sorted),
+        # so a user who types "gmt" or nothing gets the safe year-round
+        # options up top. Users can still type any specific offset
+        # (e.g. "gmt+5:45", "+10", "gmt-8") to surface any real zone.
+        if not cl or "gmt" in cl or "utc" in cl or cl.startswith(("+", "-")):
+            # Sort by observes_dst so DST-free entries come first.
+            sorted_offsets = sorted(self._REAL_GMT_OFFSETS, key=lambda x: x[4])
+            for sign, hours, minutes, label_suffix, observes_dst in sorted_offsets:
+                if minutes:
+                    label = f"GMT{sign}{hours}:{minutes:02d}"
+                else:
+                    label = f"GMT{sign}{hours}"
+                if not cl or cl in label.lower():
+                    if label not in seen:
+                        dst_marker = " (no DST)" if not observes_dst else " (DST)"
+                        results.append(app_commands.Choice(
+                            name=f"{label} — {label_suffix}{dst_marker}",
+                            value=label,
+                        ))
+                        seen.add(label)
                     if len(results) >= 25:
                         break
-                if len(results) >= 25:
-                    break
 
         if len(results) >= 25:
             return results[:25]
@@ -810,7 +867,8 @@ class Misc(commands.Cog):
             description=(
                 f"**Parsed as:** <t:{ts}:F> (<t:{ts}:R>)\n"
                 f"**Timezone:** `{tz_label}`\n\n"
-                f"Copy any format below and paste it into a message — Discord will render it for everyone in their own local time."
+                f"Copy any format below and paste it into a message\n" 
+                f"Everyone will see it in their own local time."
             ),
             color=discord.Color.pink(),
             timestamp=discord.utils.utcnow(),

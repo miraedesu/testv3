@@ -122,8 +122,14 @@ class MemberEvents(commands.Cog):
     async def cog_load(self) -> None:
         """On startup: sync DB boost state and register persistent views."""
         self.bot.add_view(BoostAttributionView())
+        # Register the boost_list attribution view (lazy import in case
+        # the boost_list cog isn't installed yet on existing setups)
+        try:
+            from cogs.boost_list import BoostListAddView
+            self.bot.add_view(BoostListAddView())
+        except ImportError:
+            pass
         asyncio.create_task(self._sync_all_boosts())
-
     def cog_unload(self):
         """Cancel any pending snapshot debounce timers."""
         for task in self._snapshot_timers.values():
@@ -584,6 +590,53 @@ class MemberEvents(commands.Cog):
             await server_log_channel.send(embed=embed)
         except discord.Forbidden:
             logger.info(f"Permission Denied: Cannot send logs to #{server_log_channel.name}")
+
+        # --- Boost list auto-update (only if boost_list cog is installed) ---
+        # Increment/decrement the existing entry's count. If a NEW booster
+        # isn't in the list yet, post an attribution embed with an
+        # "I know who it was" button so the admin can add them with defaults.
+        try:
+            from cogs.boost_list import (
+                increment_boost_count,
+                decrement_boost_count,
+                BoostListAddView,
+            )
+            boost_list_installed = True
+        except ImportError:
+            boost_list_installed = False
+
+        attribution_pending = False
+        if boost_list_installed:
+            if started_boosting:
+                if not await increment_boost_count(self.bot, after.guild.id, after.id):
+                    attribution_pending = True
+            else:  # stopped_boosting
+                await decrement_boost_count(self.bot, after.guild.id, after.id)
+
+        if attribution_pending and server_log_channel is not None:
+            attr_embed = discord.Embed(
+                title="<:boost:1534195799892955176> Boost List Update Needed",
+                description=(
+                    f"{after.mention} just boosted but isn't in the boost_list yet.\n"
+                    f"Click **I know who it was** below to add them with default "
+                    f"settings (1 boost, deadline = next annual anniversary)."
+                ),
+                color=discord.Color.gold(),
+                timestamp=discord.utils.utcnow(),
+            )
+            attr_embed.add_field(
+                name="User", value=f"{after} (`{after.id}`)", inline=False
+            )
+            attr_embed.set_thumbnail(url=after.display_avatar.url)
+            # Footer is read by the persistent view's click handler to know
+            # which user to add. Format MUST be "User ID: <id>".
+            attr_embed.set_footer(text=f"User ID: {after.id}")
+            try:
+                await server_log_channel.send(
+                    embed=attr_embed, view=BoostListAddView()
+                )
+            except discord.Forbidden:
+                pass
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Track joins for the whois command."""
@@ -807,54 +860,128 @@ class MemberEvents(commands.Cog):
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
         """
         Safety net: if boost count drifts away from what's tracked in the DB
-        (e.g., a member event was missed), log a count-only summary.
-        No member identification possible — audit logs don't track boosts.
+        (e.g., a member event was missed), reconcile the DB and log properly.
+
+        FIX for the "double log" issue: Discord fires on_member_update when
+        premium_since becomes None AND on_guild_update when the actual count
+        drops (after the 3-day grace period). These can fire in either order,
+        which previously caused two "X is no longer boosting" messages.
+        We now wait briefly for on_member_update to fire first; if it does,
+        db_count == live_count and we skip. If it doesn't, we identify stale
+        rows (members in DB but no longer premium_subscribers) and log them
+        ourselves — and delete the rows so on_member_update (if it fires
+        later) sees rowcount == 0 and doesn't re-log.
         """
         if before.premium_subscription_count == after.premium_subscription_count:
             return
 
-        # Count actual DB-tracked boosters vs. live count
+        # Wait briefly for on_member_update to handle it (and delete the row).
+        # 3s is plenty: when both fire on the same Day-3 grace-period expiry,
+        # they fire within milliseconds of each other.
+        await asyncio.sleep(3)
+
         async with self.bot.db.execute(
             "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = ?",
             (after.id,),
         ) as cursor:
             db_count = (await cursor.fetchone())[0]
 
-        # If DB matches the new count, an on_member_update already handled it.
         if db_count == after.premium_subscription_count:
+            # on_member_update already handled it — no drift, no log.
             return
 
-        # Otherwise — drift detected. Log a count-only summary so admins know
-        # something may have been missed. The next _sync_boosts run will
-        # reconcile the DB silently.
+        # Drift detected — try to identify stale/missing users.
+        actual_ids = {m.id for m in after.premium_subscribers}
+        async with self.bot.db.execute(
+            "SELECT user_id FROM guild_boosts WHERE guild_id = ?",
+            (after.id,),
+        ) as cursor:
+            db_ids = {row[0] for row in await cursor.fetchall()}
+
         log_channel = await get_log_channel(self.bot, after.id, "server-log")
-        if log_channel is None:
-            return
-
         diff = after.premium_subscription_count - before.premium_subscription_count
         tier_changed = before.premium_tier != after.premium_tier
+
+        if diff < 0:
+            # Count dropped — find stale users (in DB but not actually boosting)
+            stale_ids = db_ids - actual_ids
+            if stale_ids:
+                # Delete the stale rows so on_member_update (if it fires
+                # later) sees rowcount == 0 and doesn't double-log.
+                for uid in stale_ids:
+                    await self.bot.db.execute(
+                        "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
+                        (after.id, uid),
+                    )
+                await self.bot.db.commit()
+
+                # Also decrement any boost_list entries for these users
+                try:
+                    from cogs.boost_list import decrement_boost_count
+                    for uid in stale_ids:
+                        await decrement_boost_count(self.bot, after.id, uid)
+                except ImportError:
+                    pass
+
+                if log_channel is not None:
+                    for uid in stale_ids:
+                        member = after.get_member(uid)
+                        boost_embed = discord.Embed(
+                            title="<:boostremove:1534198057036419214> Boost Removed",
+                            description=(
+                                f"{member.mention if member else f'`{uid}`'} is no "
+                                f"longer boosting the server."
+                            ),
+                            color=discord.Color.red(),
+                            timestamp=discord.utils.utcnow(),
+                        )
+                        if member:
+                            boost_embed.set_thumbnail(url=member.display_avatar.url)
+                            boost_embed.add_field(
+                                name="User",
+                                value=f"{member} (`{member.id}`)",
+                                inline=False,
+                            )
+                        boost_embed.set_footer(
+                            text=(
+                                f"Total boosts: {after.premium_subscription_count} "
+                                f"• Level {after.premium_tier}"
+                            )
+                        )
+                        try:
+                            await log_channel.send(embed=boost_embed)
+                        except discord.Forbidden:
+                            logger.info(
+                                f"Permission Denied: Cannot send logs to "
+                                f"#{log_channel.name}"
+                            )
+                return
+
+        # Either increase drift (couldn't identify new boosters) or
+        # decrease drift with no stale rows identified — fall back to the
+        # generic count-changed message with the attribution button.
+        if log_channel is None:
+            return
 
         embed = discord.Embed(
             title="<:boost:1534195799892955176> Boost Count Changed",
             description=(
                 f"Boost count went from **{before.premium_subscription_count}** "
-                f"to **{after.premium_subscription_count}** ({'+' if diff > 0 else ''}{diff}).\n"
-                f"⚠️ DB-tracked boosters ({db_count}) don't match the live count — "
-                f"this will be reconciled on next sync."
+                f"to **{after.premium_subscription_count}** "
+                f"({'+' if diff > 0 else ''}{diff}).\n"
+                f"⚠️ DB-tracked boosters ({db_count}) don't match the live "
+                f"count — this will be reconciled on next sync."
             ),
             color=discord.Color.blurple(),
             timestamp=discord.utils.utcnow(),
         )
-
         if tier_changed:
             embed.add_field(
                 name="Tier Changed",
                 value=f"Level {before.premium_tier} → Level {after.premium_tier}",
                 inline=False,
             )
-
         embed.set_footer(text=f"Level {after.premium_tier}")
-
         try:
             await log_channel.send(embed=embed, view=BoostAttributionView())
         except discord.Forbidden:

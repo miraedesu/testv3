@@ -276,6 +276,27 @@ class Database(commands.Cog):
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
+        # --- Boost List ---
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS boost_list (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                admin_id INTEGER NOT NULL,
+                boost_count INTEGER NOT NULL DEFAULT 1,
+                boost_since INTEGER NOT NULL,
+                deadline INTEGER NOT NULL,
+                week_notified INTEGER NOT NULL DEFAULT 0,
+                three_day_notified INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (guild_id, user_id)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_boost_list_guild ON boost_list (guild_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_boost_list_deadline ON boost_list (deadline)"
+        )
         await db.commit()
         logger.info("[DB] Schema initialization complete.")
 
