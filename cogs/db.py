@@ -182,15 +182,20 @@ class Database(commands.Cog):
             )
         """)
 
-        # --- Channel Snapshots ---
+        # --- Channel Snapshots (per-guild sequential IDs) ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channel_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
+                snapshot_num INTEGER NOT NULL,
                 snapshot_data TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, snapshot_num)
             )
         """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_snapshots_guild "
+            "ON channel_snapshots (guild_id, created_at DESC)"
+        )
 
         # --- One-time Migration (Custom Reactions) ---
         await db.execute("""
@@ -276,18 +281,18 @@ class Database(commands.Cog):
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
-        # --- Boost List ---
+        # --- Boost List (per-guild sequential entry numbers) ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS boost_list (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
+                entry_num INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
-                admin_id INTEGER NOT NULL,
                 boost_count INTEGER NOT NULL DEFAULT 1,
                 boost_since INTEGER NOT NULL,
                 deadline INTEGER NOT NULL,
                 week_notified INTEGER NOT NULL DEFAULT 0,
                 three_day_notified INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, entry_num),
                 UNIQUE (guild_id, user_id)
             )
         """)

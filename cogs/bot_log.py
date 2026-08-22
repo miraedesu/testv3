@@ -97,12 +97,51 @@ class BotLog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._log_channel: discord.TextChannel | None = None
+        # ── Rate limiting ──
+        self._log_window_start: int = 0
+        self._log_count: int = 0
+        self._rate_limit_dropped: int = 0
         if BOTMSG_CHANNEL_ID is None:
             logger.warning("[BotLog] BOTMSG_CHANNEL not set in .env — cog will be inert.")
         else:
             self._resolve_task = asyncio.create_task(self._resolve_log_channel())
             self.bot._self_deleted_messages: set[int] = set()
 
+    async def _send_log(self, embed: discord.Embed) -> None:
+        if self._log_channel is None:
+            return
+
+        now_ts = int(discord.utils.utcnow().timestamp())
+
+        # Reset 60-second window
+        if now_ts - self._log_window_start >= 60:
+            # If we dropped logs in the previous window, send a summary
+            if self._rate_limit_dropped > 0:
+                summary = discord.Embed(
+                    title=f"🔇 Rate-limited — {self._rate_limit_dropped} log(s) dropped in the last minute",
+                    color=discord.Color.dark_grey(),
+                    timestamp=discord.utils.utcnow(),
+                )
+                try:
+                    await self._log_channel.send(embed=summary)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            self._log_window_start = now_ts
+            self._log_count = 0
+            self._rate_limit_dropped = 0
+
+        # Hard cap: 20 logs per 60 seconds
+        if self._log_count >= 20:
+            self._rate_limit_dropped += 1
+            return
+
+        self._log_count += 1
+        try:
+            await self._log_channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("[BotLog] Cannot send to log channel — check permissions.")
+        except discord.HTTPException as e:
+            logger.warning(f"[BotLog] HTTP error sending log: {e}")
     async def _resolve_log_channel(self) -> None:
         await self.bot.wait_until_ready()
         try:
@@ -119,15 +158,7 @@ class BotLog(commands.Cog):
         except Exception as e:
             logger.error(f"[BotLog] Error resolving log channel: {e}")
 
-    async def _send_log(self, embed: discord.Embed) -> None:
-        if self._log_channel is None:
-            return
-        try:
-            await self._log_channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.warning("[BotLog] Cannot send to log channel — check permissions.")
-        except discord.HTTPException as e:
-            logger.warning(f"[BotLog] HTTP error sending log: {e}")
+
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -185,6 +216,9 @@ class BotLog(commands.Cog):
         # Skip deletions in our own log channel (would be recursive noise)
         if message.channel.id == self._log_channel.id:
             return
+        # Skip empty bot messages (no content, no embeds, no attachments — nothing to audit)
+        if not message.content and not message.embeds and not message.attachments:
+            return        
         # Skip messages the bot is deleting itself (twitter-fix cleanup, etc.)
         if message.id in getattr(self.bot, "_self_deleted_messages", set()):
             self.bot._self_deleted_messages.discard(message.id)

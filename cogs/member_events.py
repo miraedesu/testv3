@@ -122,13 +122,6 @@ class MemberEvents(commands.Cog):
     async def cog_load(self) -> None:
         """On startup: sync DB boost state and register persistent views."""
         self.bot.add_view(BoostAttributionView())
-        # Register the boost_list attribution view (lazy import in case
-        # the boost_list cog isn't installed yet on existing setups)
-        try:
-            from cogs.boost_list import BoostListAddView
-            self.bot.add_view(BoostListAddView())
-        except ImportError:
-            pass
         asyncio.create_task(self._sync_all_boosts())
     def cog_unload(self):
         """Cancel any pending snapshot debounce timers."""
@@ -238,39 +231,45 @@ class MemberEvents(commands.Cog):
         try:
             await asyncio.sleep(600)
         except asyncio.CancelledError:
-            return # A new change came in, timer reset. Exit.
+            return
+
+        if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+            return
 
         layout = self._capture_layout(guild)
         layout_json = json.dumps(layout)
-        
-        # --- FOOLPROOF CHECK ---
-        # If the layout is exactly the same as the last time we saved, skip it.
+
         if self._last_layout.get(guild.id) == layout_json:
             logger.info(f"[History] Channel layout in {guild.name} reverted to original state. Skipping snapshot.")
             return
 
         now_ts = int(discord.utils.utcnow().timestamp())
-        
-        cursor = await self.bot.db.execute(
-            "INSERT INTO channel_snapshots (guild_id, snapshot_data, created_at) VALUES (?, ?, ?)",
-            (guild.id, layout_json, now_ts)
+
+        async with self.bot.db.execute(
+            "SELECT COALESCE(MAX(snapshot_num), 0) + 1 FROM channel_snapshots WHERE guild_id = ?",
+            (guild.id,),
+        ) as cursor:
+            snap_num = (await cursor.fetchone())[0]
+
+        await self.bot.db.execute(
+            "INSERT INTO channel_snapshots (guild_id, snapshot_num, snapshot_data, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (guild.id, snap_num, layout_json, now_ts),
         )
         await self.bot.db.commit()
-        snap_id = cursor.lastrowid
-        
-        # Update the last saved layout in memory
+
         self._last_layout[guild.id] = layout_json
-        
+
         log_channel = await get_log_channel(self.bot, guild.id, "server-log")
         if log_channel:
             embed = discord.Embed(
                 title="<:category:1534195833430474982> Channel Layout Changed",
                 description=(
                     f"Some channels were moved.\n"
-                    f"Use `/snapshot view {snap_id}` to see current layout."
+                    f"Use `/snapshot view snapshot_num:{snap_num}` to see current layout."
                 ),
                 color=discord.Color.blue(),
-                timestamp=discord.utils.utcnow()
+                timestamp=discord.utils.utcnow(),
             )
             try:
                 await log_channel.send(embed=embed)
@@ -288,25 +287,34 @@ class MemberEvents(commands.Cog):
             #    to skip saving if the layout reverted to its prior state)
             if guild.id not in self._last_layout:
                 self._last_layout[guild.id] = json.dumps(self._capture_layout(guild))
-            
-            # 3. Save an initial baseline snapshot to the database
+
+            # 3. Save an initial baseline snapshot to the database (gated)
+            if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+                continue
+
             layout = self._capture_layout(guild)
             now_ts = int(discord.utils.utcnow().timestamp())
-            
-            # Check if a snapshot was made in the last hour to avoid spamming on quick restarts
+
             async with self.bot.db.execute(
-                "SELECT id FROM channel_snapshots WHERE guild_id = ? AND created_at > ?",
-                (guild.id, now_ts - 3600)
+                "SELECT 1 FROM channel_snapshots WHERE guild_id = ? AND created_at > ?",
+                (guild.id, now_ts - 3600),
             ) as cursor:
                 recent = await cursor.fetchone()
-                
+
             if not recent:
-                cursor = await self.bot.db.execute(
-                    "INSERT INTO channel_snapshots (guild_id, snapshot_data, created_at) VALUES (?, ?, ?)",
-                    (guild.id, json.dumps(layout), now_ts)
+                async with self.bot.db.execute(
+                    "SELECT COALESCE(MAX(snapshot_num), 0) + 1 FROM channel_snapshots WHERE guild_id = ?",
+                    (guild.id,),
+                ) as cursor:
+                    snap_num = (await cursor.fetchone())[0]
+
+                await self.bot.db.execute(
+                    "INSERT INTO channel_snapshots (guild_id, snapshot_num, snapshot_data, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (guild.id, snap_num, json.dumps(layout), now_ts),
                 )
                 await self.bot.db.commit()
-                logger.info(f"[MemberEvents] Saved baseline snapshot for {guild.name}")
+                logger.info(f"[MemberEvents] Saved baseline snapshot #{snap_num} for {guild.name}")
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
         self._channel_snapshots[guild.id] = self._take_snapshot(guild)
@@ -347,39 +355,40 @@ class MemberEvents(commands.Cog):
             logger.info("Bot lacks 'View Audit Log' permission to check logs.")
 
         # Kicks/bans go to punishment-log; a plain departure goes to leave-log.
-        log_type = "punishment-log" if moderator else "leave-log"
-        log_channel = await get_log_channel(self.bot, guild.id, log_type)
+        if not await is_feature_disabled(self.bot, guild.id, "member_leave_log"):
+            log_type = "punishment-log" if moderator else "leave-log"
+            log_channel = await get_log_channel(self.bot, guild.id, log_type)
 
-        if log_channel is not None:
-            roles = [role.mention for role in member.roles if not role.is_default()]
-            roles_string = " ".join(roles) if roles else "No roles assigned."
+            if log_channel is not None:
+                roles = [role.mention for role in member.roles if not role.is_default()]
+                roles_string = " ".join(roles) if roles else "No roles assigned."
 
-            embed = discord.Embed(
-                title=action_title,
-                description=f"{member.mention} | {member.name}",
-                color=embed_color,
-                timestamp=discord.utils.utcnow(),
-            )
-            embed.set_thumbnail(url=f"attachment://{os.path.basename(chosen_img)}")
+                embed = discord.Embed(
+                    title=action_title,
+                    description=f"{member.mention} | {member.name}",
+                    color=embed_color,
+                    timestamp=discord.utils.utcnow(),
+                )
+                embed.set_thumbnail(url=f"attachment://{os.path.basename(chosen_img)}")
 
-            if moderator:
-                embed.add_field(name="Action by:", value=moderator.mention, inline=True)
-                embed.add_field(name="Reason", value=reason, inline=True)
-                embed.add_field(name="\u200b", value="\u200b", inline=True)
-            
-            embed.add_field(name="Account Created", value=f"<t:{int(member.created_at.timestamp())}:D>", inline=True)
-            embed.add_field(
-                name="Joined Server",
-                value=f"<t:{int(member.joined_at.timestamp())}:D>" if member.joined_at else "Unknown",
-                inline=True,
-            )
-            embed.add_field(name=f"Roles Had ({len(roles)})", value=roles_string, inline=False)
-            embed.set_footer(text=f"{member.id}", icon_url=member.display_avatar.url)
+                if moderator:
+                    embed.add_field(name="Action by:", value=moderator.mention, inline=True)
+                    embed.add_field(name="Reason", value=reason, inline=True)
+                    embed.add_field(name="\u200b", value="\u200b", inline=True)
+                
+                embed.add_field(name="Account Created", value=f"<t:{int(member.created_at.timestamp())}:D>", inline=True)
+                embed.add_field(
+                    name="Joined Server",
+                    value=f"<t:{int(member.joined_at.timestamp())}:D>" if member.joined_at else "Unknown",
+                    inline=True,
+                )
+                embed.add_field(name=f"Roles Had ({len(roles)})", value=roles_string, inline=False)
+                embed.set_footer(text=f"{member.id}", icon_url=member.display_avatar.url)
 
-            try:
-                await log_channel.send(file=discord.File(chosen_img), embed=embed)
-            except discord.Forbidden:
-                logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
+                try:
+                    await log_channel.send(file=discord.File(chosen_img), embed=embed)
+                except discord.Forbidden:
+                    logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
         # --- Track kicks/bans in the DB for WhoIs ---
         if moderator:
             action_type = "ban" if action_title == "Member Banned" else "kick"
@@ -430,6 +439,64 @@ class MemberEvents(commands.Cog):
             await boost_log_channel.send(embed=boost_embed)
         except discord.Forbidden:
             logger.info(f"Permission Denied: Cannot send logs to #{boost_log_channel.name}")
+    #--- Remove after Simulation--- >         
+    async def _process_boost_event(
+        self, guild: discord.Guild, member: discord.Member, started_boosting: bool
+    ) -> None:
+        """Core boost event processing — called by on_member_update and the
+        /admin simulate_boost / simulate_unboost commands.
+
+        Handles: guild_boosts dedup table + server-log embed.
+        Boost list is managed manually via /boost_list commands only."""
+        if await is_feature_disabled(self.bot, guild.id, "boost_tracker"):
+            return
+
+        # 1. guild_boosts dedup table
+        if started_boosting:
+            cursor = await self.bot.db.execute(
+                "INSERT OR IGNORE INTO guild_boosts "
+                "(guild_id, user_id, started_at) VALUES (?, ?, ?)",
+                (guild.id, member.id, int(discord.utils.utcnow().timestamp())),
+            )
+            await self.bot.db.commit()
+            if cursor.rowcount == 0:
+                return
+        else:
+            cursor = await self.bot.db.execute(
+                "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
+                (guild.id, member.id),
+            )
+            await self.bot.db.commit()
+            if cursor.rowcount == 0:
+                return
+
+        # 2. Post embed to server-log
+        server_log_channel = await get_log_channel(self.bot, guild.id, "server-log")
+        if server_log_channel is not None:
+            if started_boosting:
+                embed = discord.Embed(
+                    title="<:newboost:1534195815671660685> New Server Boost",
+                    description=f"{member.mention} just boosted the server!",
+                    color=discord.Color.blue(),
+                    timestamp=discord.utils.utcnow(),
+                )
+            else:
+                embed = discord.Embed(
+                    title="<:boostremove:1534198057036419214> Boost Removed",
+                    description=f"{member.mention} is no longer boosting the server.",
+                    color=discord.Color.red(),
+                    timestamp=discord.utils.utcnow(),
+                )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.add_field(name="User", value=f"{member} (`{member.id}`)", inline=False)
+            embed.set_footer(
+                text=f"Total boosts: {guild.premium_subscription_count} • Level {guild.premium_tier}"
+            )
+            try:
+                await server_log_channel.send(embed=embed)
+            except discord.Forbidden:
+                pass
+    #--- Remove after Simulation--- ^           
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         # --- Username change logging & DB tracking ---
@@ -479,53 +546,56 @@ class MemberEvents(commands.Cog):
 
         # --- Role-change logging (independent of the boost check below) ---
         if before.roles != after.roles:
-            user_log_channel = await get_log_channel(self.bot, after.guild.id, "user-log")
-            if user_log_channel is not None:
-                await asyncio.sleep(1)
-                now = discord.utils.utcnow()
-                async for entry in after.guild.audit_logs(action=discord.AuditLogAction.member_role_update, limit=5):
-                    if entry.target.id != after.id:
-                        continue
-                    if (now - entry.created_at).total_seconds() >= 15:
-                        continue
-                    if entry.user.bot:
+            if await is_feature_disabled(self.bot, after.guild.id, "role_change_log"):
+                pass  # Skip role-change logging
+            else:
+                user_log_channel = await get_log_channel(self.bot, after.guild.id, "user-log")
+                if user_log_channel is not None:
+                    await asyncio.sleep(1)
+                    now = discord.utils.utcnow()
+                    async for entry in after.guild.audit_logs(action=discord.AuditLogAction.member_role_update, limit=5):
+                        if entry.target.id != after.id:
+                            continue
+                        if (now - entry.created_at).total_seconds() >= 15:
+                            continue
+                        if entry.user.bot:
+                            break
+                        if entry.user.id == after.id:
+                            break
+
+                        added_roles = [role for role in after.roles if role not in before.roles]
+                        removed_roles = [role for role in before.roles if role not in after.roles]
+
+                        if added_roles:
+                            role_title = "Added Role"
+                            role_color = discord.Color.green()
+                        elif removed_roles:
+                            role_title = "Removed Role"
+                            role_color = discord.Color.red()
+                        else:
+                            break
+
+                        embed = discord.Embed(
+                            title=role_title,
+                            timestamp=discord.utils.utcnow(),
+                            description=f"Roles for {after.mention} were updated by {entry.user.mention}.",
+                            color=role_color,
+                        )
+                        if added_roles:
+                            embed.add_field(name="Added", value=", ".join(role.mention for role in added_roles), inline=False)
+                        if removed_roles:
+                            embed.add_field(name="Removed", value=", ".join(role.mention for role in removed_roles), inline=False)
+
+                        embed.add_field(name="Account Created", value=f"<t:{int(after.created_at.timestamp())}:D>", inline=True)
+                        embed.add_field(
+                            name="Joined Server",
+                            value=f"<t:{int(after.joined_at.timestamp())}:D>" if after.joined_at else "Unknown",
+                            inline=True,
+                        )
+                        embed.set_footer(text=f"User ID: {after.id}", icon_url=after.display_avatar.url)
+
+                        await user_log_channel.send(embed=embed)
                         break
-                    if entry.user.id == after.id:
-                        break
-
-                    added_roles = [role for role in after.roles if role not in before.roles]
-                    removed_roles = [role for role in before.roles if role not in after.roles]
-
-                    if added_roles:
-                        role_title = "Added Role"
-                        role_color = discord.Color.green()
-                    elif removed_roles:
-                        role_title = "Removed Role"
-                        role_color = discord.Color.red()
-                    else:
-                        break
-
-                    embed = discord.Embed(
-                        title=role_title,
-                        timestamp=discord.utils.utcnow(),
-                        description=f"Roles for {after.mention} were updated by {entry.user.mention}.",
-                        color=role_color,
-                    )
-                    if added_roles:
-                        embed.add_field(name="Added", value=", ".join(role.mention for role in added_roles), inline=False)
-                    if removed_roles:
-                        embed.add_field(name="Removed", value=", ".join(role.mention for role in removed_roles), inline=False)
-
-                    embed.add_field(name="Account Created", value=f"<t:{int(after.created_at.timestamp())}:D>", inline=True)
-                    embed.add_field(
-                        name="Joined Server",
-                        value=f"<t:{int(after.joined_at.timestamp())}:D>" if after.joined_at else "Unknown",
-                        inline=True,
-                    )
-                    embed.set_footer(text=f"User ID: {after.id}", icon_url=after.display_avatar.url)
-
-                    await user_log_channel.send(embed=embed)
-                    break
 
         # --- Boost start/stop logging (DB-backed dedup) ---
         started_boosting = before.premium_since is None and after.premium_since is not None
@@ -533,110 +603,112 @@ class MemberEvents(commands.Cog):
 
         if not (started_boosting or stopped_boosting):
             return
+        #--- Remove after Simulation--->
+        await self._process_boost_event(after.guild, after, started_boosting)
+        #--- Remove after Simulation---^
+        # if started_boosting:
+        #     # INSERT OR IGNORE → rowcount == 0 means already tracked (double event)
+        #     try:
+        #         cursor = await self.bot.db.execute(
+        #             "INSERT OR IGNORE INTO guild_boosts "
+        #             "(guild_id, user_id, started_at) VALUES (?, ?, ?)",
+        #             (after.guild.id, after.id, int(after.premium_since.timestamp())),
+        #         )
+        #         await self.bot.db.commit()
+        #         if cursor.rowcount == 0:
+        #             return  # Prevent double log
+        #     except Exception as e:
+        #         logger.error(f"[MemberEvents] Error tracking boost start: {e}")
+        #         return
+        # else:  # stopped_boosting
+        #     try:
+        #         cursor = await self.bot.db.execute(
+        #             "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
+        #             (after.guild.id, after.id),
+        #         )
+        #         await self.bot.db.commit()
+        #         if cursor.rowcount == 0:
+        #             return  # Prevent double log
+        #     except Exception as e:
+        #         logger.error(f"[MemberEvents] Error tracking boost stop: {e}")
+        #         return
 
-        if started_boosting:
-            # INSERT OR IGNORE → rowcount == 0 means already tracked (double event)
-            try:
-                cursor = await self.bot.db.execute(
-                    "INSERT OR IGNORE INTO guild_boosts "
-                    "(guild_id, user_id, started_at) VALUES (?, ?, ?)",
-                    (after.guild.id, after.id, int(after.premium_since.timestamp())),
-                )
-                await self.bot.db.commit()
-                if cursor.rowcount == 0:
-                    return  # Prevent double log
-            except Exception as e:
-                logger.error(f"[MemberEvents] Error tracking boost start: {e}")
-                return
-        else:  # stopped_boosting
-            try:
-                cursor = await self.bot.db.execute(
-                    "DELETE FROM guild_boosts WHERE guild_id = ? AND user_id = ?",
-                    (after.guild.id, after.id),
-                )
-                await self.bot.db.commit()
-                if cursor.rowcount == 0:
-                    return  # Prevent double log
-            except Exception as e:
-                logger.error(f"[MemberEvents] Error tracking boost stop: {e}")
-                return
+        # server_log_channel = await get_log_channel(self.bot, after.guild.id, "server-log")
+        # if server_log_channel is None:
+        #     return
 
-        server_log_channel = await get_log_channel(self.bot, after.guild.id, "server-log")
-        if server_log_channel is None:
-            return
+        # if started_boosting:
+        #     embed = discord.Embed(
+        #         title="<:newboost:1534195815671660685> New Server Boost",
+        #         description=f"{after.mention} just boosted the server!",
+        #         color=discord.Color.blue(),
+        #         timestamp=discord.utils.utcnow(),
+        #     )
+        # else:
+        #     embed = discord.Embed(
+        #         title="<:boostremove:1534198057036419214> Boost Removed",
+        #         description=f"{after.mention} is no longer boosting the server.",
+        #         color=discord.Color.red(),
+        #         timestamp=discord.utils.utcnow(),
+        #     )
 
-        if started_boosting:
-            embed = discord.Embed(
-                title="<:newboost:1534195815671660685> New Server Boost",
-                description=f"{after.mention} just boosted the server!",
-                color=discord.Color.blue(),
-                timestamp=discord.utils.utcnow(),
-            )
-        else:
-            embed = discord.Embed(
-                title="<:boostremove:1534198057036419214> Boost Removed",
-                description=f"{after.mention} is no longer boosting the server.",
-                color=discord.Color.red(),
-                timestamp=discord.utils.utcnow(),
-            )
+        # embed.set_thumbnail(url=after.display_avatar.url)
+        # embed.add_field(name="User", value=f"{after} (`{after.id}`)", inline=False)
+        # embed.set_footer(
+        #     text=f"Total boosts: {after.guild.premium_subscription_count} • Level {after.guild.premium_tier}"
+        # )
 
-        embed.set_thumbnail(url=after.display_avatar.url)
-        embed.add_field(name="User", value=f"{after} (`{after.id}`)", inline=False)
-        embed.set_footer(
-            text=f"Total boosts: {after.guild.premium_subscription_count} • Level {after.guild.premium_tier}"
-        )
+        # try:
+        #     await server_log_channel.send(embed=embed)
+        # except discord.Forbidden:
+        #     logger.info(f"Permission Denied: Cannot send logs to #{server_log_channel.name}")
 
-        try:
-            await server_log_channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.info(f"Permission Denied: Cannot send logs to #{server_log_channel.name}")
+        # # --- Boost list auto-update (only if boost_list cog is installed) ---
+        # # Increment/decrement the existing entry's count. If a NEW booster
+        # # isn't in the list yet, post an attribution embed with an
+        # # "I know who it was" button so the admin can add them with defaults.
+        # try:
+        #     from cogs.boost_list import (
+        #         increment_boost_count,
+        #         decrement_boost_count,
+        #         BoostListAddView,
+        #     )
+        #     boost_list_installed = True
+        # except ImportError:
+        #     boost_list_installed = False
 
-        # --- Boost list auto-update (only if boost_list cog is installed) ---
-        # Increment/decrement the existing entry's count. If a NEW booster
-        # isn't in the list yet, post an attribution embed with an
-        # "I know who it was" button so the admin can add them with defaults.
-        try:
-            from cogs.boost_list import (
-                increment_boost_count,
-                decrement_boost_count,
-                BoostListAddView,
-            )
-            boost_list_installed = True
-        except ImportError:
-            boost_list_installed = False
+        # attribution_pending = False
+        # if boost_list_installed:
+        #     if started_boosting:
+        #         if not await increment_boost_count(self.bot, after.guild.id, after.id):
+        #             attribution_pending = True
+        #     else:  # stopped_boosting
+        #         await decrement_boost_count(self.bot, after.guild.id, after.id)
 
-        attribution_pending = False
-        if boost_list_installed:
-            if started_boosting:
-                if not await increment_boost_count(self.bot, after.guild.id, after.id):
-                    attribution_pending = True
-            else:  # stopped_boosting
-                await decrement_boost_count(self.bot, after.guild.id, after.id)
-
-        if attribution_pending and server_log_channel is not None:
-            attr_embed = discord.Embed(
-                title="<:boost:1534195799892955176> Boost List Update Needed",
-                description=(
-                    f"{after.mention} just boosted but isn't in the boost_list yet.\n"
-                    f"Click **I know who it was** below to add them with default "
-                    f"settings (1 boost, deadline = next annual anniversary)."
-                ),
-                color=discord.Color.gold(),
-                timestamp=discord.utils.utcnow(),
-            )
-            attr_embed.add_field(
-                name="User", value=f"{after} (`{after.id}`)", inline=False
-            )
-            attr_embed.set_thumbnail(url=after.display_avatar.url)
-            # Footer is read by the persistent view's click handler to know
-            # which user to add. Format MUST be "User ID: <id>".
-            attr_embed.set_footer(text=f"User ID: {after.id}")
-            try:
-                await server_log_channel.send(
-                    embed=attr_embed, view=BoostListAddView()
-                )
-            except discord.Forbidden:
-                pass
+        # if attribution_pending and server_log_channel is not None:
+        #     attr_embed = discord.Embed(
+        #         title="<:boost:1534195799892955176> Boost List Update Needed",
+        #         description=(
+        #             f"{after.mention} just boosted but isn't in the boost_list yet.\n"
+        #             f"Click **I know who it was** below to add them with default "
+        #             f"settings (1 boost, deadline = next annual anniversary)."
+        #         ),
+        #         color=discord.Color.gold(),
+        #         timestamp=discord.utils.utcnow(),
+        #     )
+        #     attr_embed.add_field(
+        #         name="User", value=f"{after} (`{after.id}`)", inline=False
+        #     )
+        #     attr_embed.set_thumbnail(url=after.display_avatar.url)
+        #     # Footer is read by the persistent view's click handler to know
+        #     # which user to add. Format MUST be "User ID: <id>".
+        #     attr_embed.set_footer(text=f"User ID: {after.id}")
+        #     try:
+        #         await server_log_channel.send(
+        #             embed=attr_embed, view=BoostListAddView()
+        #         )
+        #     except discord.Forbidden:
+        #         pass
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Track joins for the whois command."""
@@ -651,6 +723,8 @@ class MemberEvents(commands.Cog):
             logger.error(f"[MemberEvents] Error tracking join: {e}")
     @commands.Cog.listener()
     async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
+        if await is_feature_disabled(self.bot, after.guild.id, "role_change_log"):
+            return
         if before.permissions == after.permissions:
             return
 
@@ -699,6 +773,8 @@ class MemberEvents(commands.Cog):
             logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role):
+        if await is_feature_disabled(self.bot, role.guild.id, "role_change_log"):
+            return
         log_channel = await get_log_channel(self.bot, role.guild.id, "server-log")
         if log_channel is None:
             return
@@ -735,6 +811,8 @@ class MemberEvents(commands.Cog):
             logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
+        if await is_feature_disabled(self.bot, role.guild.id, "role_change_log"):
+            return
         log_channel = await get_log_channel(self.bot, role.guild.id, "server-log")
         if log_channel is None:
             return
@@ -773,12 +851,16 @@ class MemberEvents(commands.Cog):
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
         # 1. Handle Position/Category changes (Snapshot Buffer)
         if before.position != after.position or before.category_id != after.category_id:
-            self._trigger_snapshot_buffer(after.guild)
+            if not await is_feature_disabled(self.bot, after.guild.id, "channel_layout_screenshot"):
+                self._trigger_snapshot_buffer(after.guild)
 
         # 2. Handle Permission Overwrite changes
         if before.overwrites == after.overwrites:
-            return  # Only care about permission changes from here on
+            return
 
+        if await is_feature_disabled(self.bot, after.guild.id, "channel_permission_log"):
+            return
+        
         log_channel = await get_log_channel(self.bot, after.guild.id, "server-log")
         if log_channel is None:
             return

@@ -12,7 +12,7 @@ import json
 import logging
 import asyncio
 import aiohttp
-
+from common.feature_toggles import is_feature_disabled
 
 # Default settings if user hasn't set a timezone
 DEFAULT_DATEPARSER_SETTINGS = {
@@ -109,7 +109,13 @@ WISE_QUOTE_URL = "https://api.wise.com/v2/quotes"
 
 logger = logging.getLogger(__name__)
 
-
+async def _next_snapshot_num(db, guild_id: int) -> int:
+    async with db.execute(
+        "SELECT COALESCE(MAX(snapshot_num), 0) + 1 FROM channel_snapshots WHERE guild_id = ?",
+        (guild_id,),
+    ) as cursor:
+        return (await cursor.fetchone())[0]
+    
 async def get_user_timezone(db, user_id: int) -> str | None:
     """Fetch a user's saved timezone from the DB."""
     async with db.execute("SELECT timezone FROM user_timezones WHERE user_id = ?", (user_id,)) as cursor:
@@ -138,11 +144,11 @@ def get_dateparser_tz_string(tz_str: str) -> str:
 #  PAGINATION VIEW
 # ============================================================
 class LayoutPagination(discord.ui.View):
-    def __init__(self, pages: list[str], author: discord.abc.User, snapshot_id: int, created_dt: datetime):
+    def __init__(self, pages: list[str], author: discord.abc.User, snapshot_num: int, created_dt: datetime):
         super().__init__(timeout=120)
         self.pages = pages
         self.author = author
-        self.snapshot_id = snapshot_id
+        self.snapshot_num = snapshot_num
         self.created_dt = created_dt
         self.page = 0
         self.max_page = len(pages) - 1
@@ -150,7 +156,7 @@ class LayoutPagination(discord.ui.View):
 
     def create_embed(self) -> discord.Embed:
         embed = discord.Embed(
-            title=f"Channel Snapshot #{self.snapshot_id}",
+            title=f"Channel Snapshot #{self.snapshot_num}",
             description=self.pages[self.page],
             color=discord.Color.pink(),
             timestamp=self.created_dt
@@ -158,7 +164,7 @@ class LayoutPagination(discord.ui.View):
         embed.set_footer(text=f"Page {self.page + 1}/{self.max_page + 1} • Captured on")
         self.update_buttons()
         return embed
-
+    # ... rest unchanged ...
     def update_buttons(self):
         self.prev.disabled = self.page == 0
         self.next.disabled = self.page == self.max_page
@@ -234,8 +240,9 @@ class ComparePagination(discord.ui.View):
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 class SnapshotPagination(discord.ui.View):
     def __init__(self, snapshots: list[tuple[int, int]], author: discord.abc.User):
+        # snapshots = list of (snapshot_num, created_at_ts)
         super().__init__(timeout=120)
-        self.snapshots = snapshots  # list of (snapshot_id, created_at_ts)
+        self.snapshots = snapshots
         self.author = author
         self.page = 0
         self.per_page = 10
@@ -257,9 +264,8 @@ class SnapshotPagination(discord.ui.View):
             embed.description = "No snapshots on this page."
         else:
             description_lines = []
-            for snap_id, created_ts in entries:
-                description_lines.append(f"**#{snap_id}** • <t:{created_ts}:F> (<t:{created_ts}:R>)")
-            
+            for snap_num, created_ts in entries:
+                description_lines.append(f"**#{snap_num}** • <t:{created_ts}:F> (<t:{created_ts}:R>)")
             embed.description = "\n".join(description_lines)
 
         embed.set_footer(text=f"Page {self.page + 1}/{self.max_page + 1} • Total: {len(self.snapshots)}")
@@ -386,6 +392,8 @@ class Misc(commands.Cog):
         Runtime layout changes are handled by MemberEvents._trigger_snapshot_buffer."""
         await self.bot.wait_until_ready()
         for guild in self.bot.guilds:
+            if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+                continue
             try:
                 await self._capture_if_changed(guild)
             except Exception as e:
@@ -412,7 +420,6 @@ class Misc(commands.Cog):
         return {"categories": categories, "uncategorized": uncategorized}
 
     async def _capture_if_changed(self, guild: discord.Guild) -> None:
-        """Save a new snapshot only if no snapshot exists or the layout differs."""
         current_data = self._capture_guild_layout(guild)
         current_json = json.dumps(current_data, sort_keys=True)
 
@@ -430,12 +437,14 @@ class Misc(commands.Cog):
                 return
 
         now_ts = int(discord.utils.utcnow().timestamp())
+        snap_num = await _next_snapshot_num(self.bot.db, guild.id)
         await self.bot.db.execute(
-            "INSERT INTO channel_snapshots (guild_id, snapshot_data, created_at) VALUES (?, ?, ?)",
-            (guild.id, current_json, now_ts),
+            "INSERT INTO channel_snapshots (guild_id, snapshot_num, snapshot_data, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (guild.id, snap_num, current_json, now_ts),
         )
         await self.bot.db.commit()
-        logger.info(f"[Misc] Captured new snapshot for guild {guild.id} ({guild.name}).")
+        logger.info(f"[Misc] Captured snapshot #{snap_num} for guild {guild.id} ({guild.name}).")
 
     @tasks.loop(seconds=15.0)
     async def check_reminders(self):
@@ -1181,29 +1190,26 @@ class Misc(commands.Cog):
         default_permissions=discord.Permissions(administrator=True)
     )
     @snapshot.command(name="view", description="View a saved channel layout snapshot.")
-    @app_commands.describe(snapshot_id="The ID of the snapshot to view")
+    @app_commands.describe(snapshot_num="The per-guild snapshot number to view")
     @app_commands.checks.has_permissions(administrator=True)
-    async def snapshot_view(self, interaction: discord.Interaction, snapshot_id: int):
+    async def snapshot_view(self, interaction: discord.Interaction, snapshot_num: int):
         await interaction.response.defer(ephemeral=True)
-        
+
         async with self.bot.db.execute(
-            "SELECT guild_id, snapshot_data, created_at FROM channel_snapshots WHERE id = ?",
-            (snapshot_id,)
+            "SELECT snapshot_data, created_at FROM channel_snapshots "
+            "WHERE guild_id = ? AND snapshot_num = ?",
+            (interaction.guild.id, snapshot_num),
         ) as cursor:
             row = await cursor.fetchone()
-            
+
         if not row:
-            await interaction.followup.send("❌ Snapshot not found.", ephemeral=True)
-            return
-            
-        guild_id, data_str, created_at = row
-        if guild_id != interaction.guild.id:
             await interaction.followup.send("❌ Snapshot not found in this server.", ephemeral=True)
             return
-            
+
+        data_str, created_at = row
         data = json.loads(data_str)
         created_dt = datetime.fromtimestamp(created_at)
-        
+
         # Build the full text representation
         lines = []
         for cat in data["categories"]:
@@ -1211,44 +1217,38 @@ class Misc(commands.Cog):
             for ch in cat["channels"]:
                 icon = "<:voice_chat:1534195973058859249>" if ch["type"] == "voice" else "<:text_channel:1534196045616124054>"
                 lines.append(f"  {icon} {ch['name']}")
-            lines.append("") # Spacer
-                
+            lines.append("")
+
         if data["uncategorized"]:
             lines.append("**Uncategorized**")
             for ch in data["uncategorized"]:
                 icon = "<:voice_chat:1534195973058859249>" if ch["type"] == "voice" else "<:text_channel:1534196045616124054>"
                 lines.append(f"  {icon} {ch['name']}")
-                
+
         full_text = "\n".join(lines)
-        
-        # Split into pages of 4000 characters max (safely below 4096 limit)
-        # We split at newlines to avoid cutting a line in half
+
         pages = []
         current_page = ""
-        
         for line in full_text.split("\n"):
             if len(current_page) + len(line) + 1 > 4000:
                 pages.append(current_page)
                 current_page = line + "\n"
             else:
                 current_page += line + "\n"
-                
         if current_page:
             pages.append(current_page)
-            
-        # If everything fits in one page, just send it
+
         if len(pages) == 1:
             embed = discord.Embed(
-                title=f"Channel Snapshot #{snapshot_id}",
+                title=f"Channel Snapshot #{snapshot_num}",
                 description=pages[0],
                 color=discord.Color.pink(),
-                timestamp=created_dt
+                timestamp=created_dt,
             )
             embed.set_footer(text="Captured on")
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
-            # Use pagination for large layouts
-            view = LayoutPagination(pages, interaction.user, snapshot_id, created_dt)
+            view = LayoutPagination(pages, interaction.user, snapshot_num, created_dt)
             embed = view.create_embed()
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
             view.message = await interaction.original_response()
@@ -1256,10 +1256,11 @@ class Misc(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def snapshot_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
+
         async with self.bot.db.execute(
-            "SELECT id, created_at FROM channel_snapshots WHERE guild_id = ? ORDER BY created_at DESC",
-            (interaction.guild.id,)
+            "SELECT snapshot_num, created_at FROM channel_snapshots "
+            "WHERE guild_id = ? ORDER BY snapshot_num DESC",
+            (interaction.guild.id,),
         ) as cursor:
             snapshots = await cursor.fetchall()
 
@@ -1269,62 +1270,61 @@ class Misc(commands.Cog):
 
         view = SnapshotPagination(snapshots, interaction.user)
         embed = view.create_embed()
-        
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         view.message = await interaction.original_response()
     @snapshot.command(name="compare", description="Compare two channel layout snapshots")
-    @app_commands.describe(snapshot_id1="The first snapshot ID", snapshot_id2="The second snapshot ID")
+    @app_commands.describe(snapshot_num1="First snapshot number", snapshot_num2="Second snapshot number")
     @app_commands.checks.has_permissions(administrator=True)
-    async def snapshot_compare(self, interaction: discord.Interaction, snapshot_id1: int, snapshot_id2: int):
+    async def snapshot_compare(self, interaction: discord.Interaction, snapshot_num1: int, snapshot_num2: int):
         await interaction.response.defer(ephemeral=True)
-        
+
         async with self.bot.db.execute(
-            "SELECT guild_id, snapshot_data, created_at FROM channel_snapshots WHERE id = ?",
-            (snapshot_id1,)
+            "SELECT snapshot_data, created_at FROM channel_snapshots "
+            "WHERE guild_id = ? AND snapshot_num = ?",
+            (interaction.guild.id, snapshot_num1),
         ) as cursor:
             row1 = await cursor.fetchone()
-            
+
         async with self.bot.db.execute(
-            "SELECT guild_id, snapshot_data, created_at FROM channel_snapshots WHERE id = ?",
-            (snapshot_id2,)
+            "SELECT snapshot_data, created_at FROM channel_snapshots "
+            "WHERE guild_id = ? AND snapshot_num = ?",
+            (interaction.guild.id, snapshot_num2),
         ) as cursor:
             row2 = await cursor.fetchone()
-            
+
         if not row1 or not row2:
             await interaction.followup.send("❌ One or both snapshots not found.", ephemeral=True)
             return
-            
-        if row1[0] != interaction.guild.id or row2[0] != interaction.guild.id:
-            await interaction.followup.send("❌ Snapshots not found in this server.", ephemeral=True)
-            return
-            
-        data1 = json.loads(row1[1])
-        data2 = json.loads(row2[1])
-        
+
+        data1 = json.loads(row1[0])
+        data2 = json.loads(row2[0])
+
         cats1 = {c['name']: c['channels'] for c in data1.get("categories", [])}
         cats2 = {c['name']: c['channels'] for c in data2.get("categories", [])}
         uncat1 = data1.get("uncategorized", [])
         uncat2 = data2.get("uncategorized", [])
-        
+
         all_cats = sorted(set(list(cats1.keys()) + list(cats2.keys())))
         if uncat1 or uncat2:
             all_cats.append("Uncategorized")
-            
+
         embeds = []
         current_embed = discord.Embed(
-            title=f"Comparing Snapshots #{snapshot_id1} vs #{snapshot_id2}",
+            title=f"Comparing Snapshots #{snapshot_num1} vs #{snapshot_num2}",
             color=discord.Color.blue(),
-            timestamp=datetime.fromtimestamp(row2[2])
+            timestamp=datetime.fromtimestamp(row2[1]),
         )
-        current_embed.description = f"**#{snapshot_id1}** (<t:{row1[2]}:F>)\n**#{snapshot_id2}** (<t:{row2[2]}:F>)"
-        
+        current_embed.description = (
+            f"**#{snapshot_num1}** (<t:{row1[1]}:F>)\n**#{snapshot_num2}** (<t:{row2[1]}:F>)"
+        )
+
         field_count = 0
-        
+
         def get_channels(cat_name, cats, uncat):
             if cat_name == "Uncategorized":
                 return uncat
             return cats.get(cat_name, [])
-            
+
         def build_channel_list(channels):
             if not channels:
                 return "*No channels*"
@@ -1333,24 +1333,32 @@ class Misc(commands.Cog):
                 icon = "<:voice_chat:1534195973058859249>" if ch["type"] == "voice" else "<:text_channel:1534196045616124054>"
                 lines.append(f"{icon} {ch['name']}")
             return "\n".join(lines)
-            
+
         for cat_name in all_cats:
             ch1 = get_channels(cat_name, cats1, uncat1)
             ch2 = get_channels(cat_name, cats2, uncat2)
-            
-            # 3 fields per category (Left, Right, Spacer). Max 25 fields per embed.
+
             if field_count + 3 > 25:
                 embeds.append(current_embed)
-                current_embed = discord.Embed(title=f"Comparing #{snapshot_id1} vs #{snapshot_id2} (Cont.)", color=discord.Color.blue())
+                current_embed = discord.Embed(
+                    title=f"Comparing #{snapshot_num1} vs #{snapshot_num2} (Cont.)",
+                    color=discord.Color.blue(),
+                )
                 field_count = 0
-                
-            current_embed.add_field(name=f"<:category:1534195833430474982> {cat_name} (#{snapshot_id1})", value=build_channel_list(ch1), inline=True)
-            current_embed.add_field(name=f"<:category:1534195833430474982> {cat_name} (#{snapshot_id2})", value=build_channel_list(ch2), inline=True)
-            current_embed.add_field(name="\u200b", value="\u200b", inline=True) # Spacer to force pairs
+
+            current_embed.add_field(
+                name=f"<:category:1534195833430474982> {cat_name} (#{snapshot_num1})",
+                value=build_channel_list(ch1), inline=True,
+            )
+            current_embed.add_field(
+                name=f"<:category:1534195833430474982> {cat_name} (#{snapshot_num2})",
+                value=build_channel_list(ch2), inline=True,
+            )
+            current_embed.add_field(name="\u200b", value="\u200b", inline=True)
             field_count += 3
-            
+
         embeds.append(current_embed)
-        
+
         if len(embeds) == 1:
             await interaction.followup.send(embed=embeds[0], ephemeral=True)
         else:
@@ -1358,31 +1366,25 @@ class Misc(commands.Cog):
             await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
             view.message = await interaction.original_response()
     @snapshot.command(name="delete", description="Delete a saved channel layout snapshot.")
-    @app_commands.describe(snapshot_id="The ID of the snapshot to delete")
+    @app_commands.describe(snapshot_num="The per-guild snapshot number to delete")
     @app_commands.checks.has_permissions(administrator=True)
-    async def snapshot_delete(self, interaction: discord.Interaction, snapshot_id: int):
+    async def snapshot_delete(self, interaction: discord.Interaction, snapshot_num: int):
         async with self.bot.db.execute(
-            "SELECT guild_id FROM channel_snapshots WHERE id = ?",
-            (snapshot_id,),
+            "SELECT 1 FROM channel_snapshots WHERE guild_id = ? AND snapshot_num = ?",
+            (interaction.guild.id, snapshot_num),
         ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row:
-            await interaction.response.send_message("❌ Snapshot not found.", ephemeral=True)
-            return
-
-        if row[0] != interaction.guild.id:
-            await interaction.response.send_message("❌ Snapshot not found in this server.", ephemeral=True)
-            return
+            if not await cursor.fetchone():
+                await interaction.response.send_message("❌ Snapshot not found in this server.", ephemeral=True)
+                return
 
         await self.bot.db.execute(
-            "DELETE FROM channel_snapshots WHERE id = ?",
-            (snapshot_id,),
+            "DELETE FROM channel_snapshots WHERE guild_id = ? AND snapshot_num = ?",
+            (interaction.guild.id, snapshot_num),
         )
         await self.bot.db.commit()
 
         await interaction.response.send_message(
-            f"✅ Snapshot #{snapshot_id} has been deleted.", ephemeral=True
+            f"✅ Snapshot #{snapshot_num} has been deleted.", ephemeral=True
         )
     @app_commands.command(name="say", description="Make the bot send a message to a specific channel")
     @app_commands.default_permissions(administrator=True)

@@ -73,7 +73,38 @@ async def set_allowed_role_id(bot, guild_id: int, role_id: int | None) -> None:
             (guild_id, str(role_id)),
         )
     await bot.db.commit()
+# ── BOOST_LIST_MENTION helpers ──────────────────────────────────────────
+async def get_boost_list_mention_id(bot, guild_id: int) -> int | None:
+    async with bot.db.execute(
+        "SELECT setting_value FROM guild_settings "
+        "WHERE guild_id = ? AND setting_key = 'boost_list_mention_user_id'",
+        (guild_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (ValueError, TypeError):
+        return None
 
+
+async def set_boost_list_mention_id(bot, guild_id: int, user_id: int | None) -> None:
+    if user_id is None:
+        await bot.db.execute(
+            "DELETE FROM guild_settings "
+            "WHERE guild_id = ? AND setting_key = 'boost_list_mention_user_id'",
+            (guild_id,),
+        )
+    else:
+        await bot.db.execute(
+            "INSERT INTO guild_settings (guild_id, setting_key, setting_value) "
+            "VALUES (?, 'boost_list_mention_user_id', ?) "
+            "ON CONFLICT(guild_id, setting_key) "
+            "DO UPDATE SET setting_value = excluded.setting_value",
+            (guild_id, str(user_id)),
+        )
+    await bot.db.commit()
 
 async def resolve_allowed_role(bot, guild: discord.Guild) -> discord.Role | None:
     """Per-guild configured role, falling back to the default-name lookup."""
@@ -205,7 +236,44 @@ class GuildSettings(commands.Cog):
             "✅ Per-guild allowed role cleared. Default fallback will be used.",
             ephemeral=True,
         )
+    # ── boost_list_mention ───────────────────────────────────────────
+    @group.command(name="boost_list_mention", description="Set who gets pinged for boost deadline reminders")
+    @app_commands.describe(user="User to ping when boost deadlines approach")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def boost_list_mention_set(self, interaction: discord.Interaction, user: discord.User):
+        await set_boost_list_mention_id(self.bot, interaction.guild.id, user.id)
+        await interaction.response.send_message(
+            f"✅ Boost deadline reminders will ping {user.mention}.",
+            ephemeral=True,
+        )
 
+    @group.command(name="boost_list_mention_view", description="Show who gets pinged for boost deadline reminders")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def boost_list_mention_view(self, interaction: discord.Interaction):
+        uid = await get_boost_list_mention_id(self.bot, interaction.guild.id)
+        if uid is None:
+            await interaction.response.send_message(
+                "No boost mention user set. Deadline reminders will be skipped until you set one.",
+                ephemeral=True,
+            )
+            return
+        user = interaction.guild.get_member(uid) or self.bot.get_user(uid)
+        label = user.mention if user else f"`{uid}` (not found)"
+        await interaction.response.send_message(
+            f"Boost deadline reminders ping: {label}", ephemeral=True
+        )
+
+    @group.command(name="boost_list_mention_clear", description="Clear the boost deadline reminder ping user")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def boost_list_mention_clear(self, interaction: discord.Interaction):
+        await set_boost_list_mention_id(self.bot, interaction.guild.id, None)
+        await interaction.response.send_message(
+            "✅ Boost mention user cleared. Reminders will be skipped until set.",
+            ephemeral=True,
+        )
     # ── disable_feature / enable_feature ────────────────────────────
     @group.command(name="disable_feature", description="Disable a feature for #channel or the whole server")
     @app_commands.describe(

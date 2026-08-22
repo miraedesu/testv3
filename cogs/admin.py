@@ -421,6 +421,96 @@ class Admin(commands.Cog):
                 f"Make sure you typed the name exactly as it appears in `/whois names`.",
                 ephemeral=True
             )
+    #--- Remove after Simulation--->
+    @admin_group.command(name="simulate_boost", description="Simulate a boost event for testing (bot owner only)")
+    @app_commands.describe(user="Member to simulate the boost for")
+    @is_bot_owner()
+    @app_commands.guild_only()
+    async def simulate_boost(self, interaction: discord.Interaction, user: discord.Member):
+        """Fires the same boost-start logic as on_member_update:
+        inserts into guild_boosts, posts the New Boost embed to server-log,
+        and increments boost_list or posts the 'I know who it was' attribution."""
+        member_events = self.bot.get_cog("MemberEvents")
+        if member_events is None:
+            await interaction.response.send_message(
+                "❌ MemberEvents cog not loaded.", ephemeral=True
+            )
+            return
 
+        await interaction.response.send_message(
+            f"🎭 Simulating **boost start** for {user.mention}...", ephemeral=True
+        )
+        await member_events._process_boost_event(interaction.guild, user, started_boosting=True)
+        await interaction.followup.send(
+            "✅ Simulated. Check server-log for the embed and/or attribution button.",
+            ephemeral=True,
+        )
+
+    @admin_group.command(name="simulate_unboost", description="Simulate a boost removal event for testing (bot owner only)")
+    @app_commands.describe(user="Member to simulate the unboost for")
+    @is_bot_owner()
+    @app_commands.guild_only()
+    async def simulate_unboost(self, interaction: discord.Interaction, user: discord.Member):
+        """Fires the same boost-stop logic as on_member_update:
+        deletes from guild_boosts, posts the Boost Removed embed to server-log,
+        and decrements boost_list (removes entry if count drops to 0)."""
+        member_events = self.bot.get_cog("MemberEvents")
+        if member_events is None:
+            await interaction.response.send_message(
+                "❌ MemberEvents cog not loaded.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"🎭 Simulating **boost removal** for {user.mention}...", ephemeral=True
+        )
+        await member_events._process_boost_event(interaction.guild, user, started_boosting=False)
+        await interaction.followup.send(
+            "✅ Simulated. Check server-log for the embed.",
+            ephemeral=True,
+        )
+    @admin_group.command(name="simulate_boost_drift", description="Simulate a boost count drift where the booster is unknown (bot owner only)")
+    @is_bot_owner()
+    @app_commands.guild_only()
+    async def simulate_boost_drift(self, interaction: discord.Interaction):
+        """Simulates the on_guild_update drift path: boost count changed but
+        we don't know who. Posts the 'Boost Count Changed' embed with the
+        'I know who it was' attribution button (BoostAttributionView)."""
+        member_events = self.bot.get_cog("MemberEvents")
+        if member_events is None:
+            await interaction.response.send_message(
+                "❌ MemberEvents cog not loaded.", ephemeral=True
+            )
+            return
+
+        from common.settings_store import get_log_channel
+        log_channel = await get_log_channel(self.bot, interaction.guild.id, "server-log")
+        if log_channel is None:
+            await interaction.response.send_message(
+                "❌ No server-log channel set for this guild.", ephemeral=True
+            )
+            return
+
+        from cogs.member_events import BoostAttributionView
+        embed = discord.Embed(
+            title="<:boost:1534195799892955176> Boost Count Changed",
+            description=(
+                f"⚠️ Simulated drift: DB-tracked boosters don't match the live count.\n"
+                f"Click **I know who it was** below to attribute this change."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text=f"Level {interaction.guild.premium_tier}")
+        try:
+            await log_channel.send(embed=embed, view=BoostAttributionView())
+        except discord.Forbidden:
+            pass
+
+        await interaction.response.send_message(
+            "✅ Simulated drift. Check server-log for the attribution button.",
+            ephemeral=True,
+        )
+    #--- Remove after Simulation---^
 async def setup(bot: commands.Bot):
     await bot.add_cog(Admin(bot))

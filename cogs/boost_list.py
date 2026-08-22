@@ -2,14 +2,13 @@
 
 Tracks sponsored nitro boosters: their boost count, since-when date, and an
 annual deadline (next (month, day) anniversary of when they started boosting).
-Two reminders ping the responsible admin 1 week and 3 days before each
-booster's deadline, posted to the guild's "server-log" channel.
+Two reminders are posted to the guild's "server-log" channel 1 week and 3
+days before each booster's deadline.
 
 Auto-tracking: when a `on_member_update` boost event fires, the boost_count
 of an existing entry is incremented/decremented automatically. If a member
-starts boosting but isn't in the list yet, an attribution embed is posted
-with an "I know who it was" button so the admin can add them with defaults.
-If a decrement would drop a user's count to 0, the entry is auto-deleted.
+starts boosting but isn't in the list yet, an embed is posted with an
+"Add to boost list" button so the admin can add them with defaults.
 """
 from __future__ import annotations
 
@@ -19,71 +18,76 @@ from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-
 from common.settings_store import get_log_channel
+from cogs.guild_settings import get_boost_list_mention_id
 
 logger = logging.getLogger(__name__)
 
 
 # ── Deadline helpers ────────────────────────────────────────────────────
-
 def calculate_next_deadline(boost_since_ts: int, now_ts: int | None = None) -> int:
-    """Next annual deadline = next (month, day) anniversary of boost_since.
+    """Next annual deadline = next (month, day, time) anniversary of boost_since.
 
-    If this year's anniversary has already passed (strict less-than, by date),
-    returns next year's anniversary. Feb 29 falls back to Feb 28 in non-leap
-    years.
+    Preserves the exact time-of-day from boost_since. If this year's
+    anniversary date has already passed OR is today, returns next year's
+    anniversary. Feb 29 falls back to Feb 28 in non-leap years.
     """
     if now_ts is None:
         now_ts = int(discord.utils.utcnow().timestamp())
     boost_since = datetime.fromtimestamp(boost_since_ts, tz=timezone.utc)
     now = datetime.fromtimestamp(now_ts, tz=timezone.utc)
-    boost_since_date = boost_since.replace(hour=0, minute=0, second=0, microsecond=0)
+
     now_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     try:
-        this_year = boost_since_date.replace(year=now_date.year)
+        this_year = boost_since.replace(year=now_date.year)
     except ValueError:  # Feb 29 in non-leap year
-        this_year = boost_since_date.replace(year=now_date.year, day=28)
+        this_year = boost_since.replace(year=now_date.year, day=28)
 
-    if this_year < now_date:
+    # Compare by date only (not time) so the anniversary at 12:28pm today
+    # still counts as "this year" — only move to next year if the date has passed
+    this_year_date = this_year.replace(hour=0, minute=0, second=0, microsecond=0)
+    if this_year_date <= now_date:
         try:
-            return int(this_year.replace(year=now_date.year + 1).timestamp())
+            return int(boost_since.replace(year=now_date.year + 1).timestamp())
         except ValueError:
-            return int(this_year.replace(year=now_date.year + 1, day=28).timestamp())
+            return int(boost_since.replace(year=now_date.year + 1, day=28).timestamp())
     return int(this_year.timestamp())
-
-
 # ── Reminder dispatch (posts to the guild's server-log channel) ──────────
 
 async def _post_reminder(
-    bot, guild_id: int, admin_id: int, booster_id: int, deadline_ts: int,
-    days_label: str,
+    bot, guild_id: int, booster_id: int, deadline_ts: int, days_label: str,
 ) -> bool:
     """Post a deadline reminder to the guild's server-log channel.
-    Returns True if posted, False if the channel is unset/unreachable."""
+    Pings the guild's configured boost_list_mention user if set, but always
+    posts the reminder regardless.
+    Returns True if posted, False only if the channel is unset/unreachable."""
     log_channel = await get_log_channel(bot, guild_id, "server-log")
     if log_channel is None:
         logger.info(
-            f"[BoostList] No server-log channel set for guild {guild_id}; "
+            f"[BoostList] No server-log channel for guild {guild_id}; "
             f"skipping {days_label} reminder for booster {booster_id}."
         )
         return False
 
+    admin_id = await get_boost_list_mention_id(bot, guild_id)
+    if admin_id is not None:
+        ping_content = f"<@{admin_id}>"
+    else:
+        ping_content = None
+
     embed = discord.Embed(
-        title=f"<:boost:1534195799892955176> Boost Deadline — {days_label}",
+        title=f"<:newboost:1534195815671660685> Boost Expiring in — {days_label}",
         description=(
-            f"<@{admin_id}> — Booster <@{booster_id}> has their boost "
-            f"deadline in **{days_label}** (<t:{deadline_ts}:F>)."
+            f"<@{booster_id}> server boost is expiring"
+            f"in **{days_label}** (<t:{deadline_ts}:F>)."
         ),
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.set_footer(text=f"Booster ID: {booster_id} • Admin ID: {admin_id}")
+    embed.set_footer(text=f"Booster ID: {booster_id}")
     try:
-        await log_channel.send(
-            content=f"<@{admin_id}>", embed=embed
-        )
+        await log_channel.send(content=ping_content, embed=embed)
         return True
     except (discord.Forbidden, discord.HTTPException) as e:
         logger.warning(
@@ -96,29 +100,33 @@ async def _post_reminder(
 # ── Boost list mutation helpers (used by both this cog and member_events) ──
 
 async def add_to_boost_list(
-    bot, guild_id: int, user_id: int, admin_id: int,
-    boost_since_ts: int | None = None, boost_count: int = 1,
-    deadline_ts: int | None = None,
+    bot, guild_id: int, user_id: int,
+    boost_since_ts: int | None = None, deadline_ts: int | None = None,
 ) -> int | None:
-    """Add a user to boost_list. Returns entry ID, or None if already present."""
+    """Add a user to boost_list with boost_count=1. Returns entry_num, or
+    None if already present."""
     if boost_since_ts is None:
         boost_since_ts = int(discord.utils.utcnow().timestamp())
     if deadline_ts is None:
         deadline_ts = calculate_next_deadline(boost_since_ts)
-    if boost_count < 1:
-        boost_count = 1
+
+    async with bot.db.execute(
+        "SELECT COALESCE(MAX(entry_num), 0) + 1 FROM boost_list WHERE guild_id = ?",
+        (guild_id,),
+    ) as cursor:
+        entry_num = (await cursor.fetchone())[0]
 
     try:
-        cursor = await bot.db.execute(
-            "INSERT INTO boost_list (guild_id, user_id, admin_id, boost_count, "
+        await bot.db.execute(
+            "INSERT INTO boost_list (guild_id, entry_num, user_id, boost_count, "
             "boost_since, deadline, week_notified, three_day_notified) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
-            (guild_id, user_id, admin_id, boost_count, boost_since_ts, deadline_ts),
+            "VALUES (?, ?, ?, 1, ?, ?, 0, 0)",
+            (guild_id, entry_num, user_id, boost_since_ts, deadline_ts),
         )
         await bot.db.commit()
     except Exception:
-        return None  # UNIQUE constraint — already in list
-    return cursor.lastrowid
+        return None
+    return entry_num
 
 
 async def increment_boost_count(bot, guild_id: int, user_id: int) -> bool:
@@ -133,11 +141,10 @@ async def increment_boost_count(bot, guild_id: int, user_id: int) -> bool:
 
 
 async def decrement_boost_count(bot, guild_id: int, user_id: int) -> bool:
-    """Decrement boost_count. If it would drop to 0, delete the entry.
-
-    Returns True if an entry was found (and either decremented or removed)."""
+    """Decrement boost_count. If it would drop to 0, delete the entry and
+    renumber remaining entries. Returns True if an entry was found."""
     async with bot.db.execute(
-        "SELECT id, boost_count FROM boost_list WHERE guild_id = ? AND user_id = ?",
+        "SELECT entry_num, boost_count FROM boost_list WHERE guild_id = ? AND user_id = ?",
         (guild_id, user_id),
     ) as cursor:
         row = await cursor.fetchone()
@@ -145,20 +152,36 @@ async def decrement_boost_count(bot, guild_id: int, user_id: int) -> bool:
     if row is None:
         return False
 
-    entry_id, count = row
+    entry_num, count = row
     if count <= 1:
-        await bot.db.execute("DELETE FROM boost_list WHERE id = ?", (entry_id,))
+        await bot.db.execute(
+            "DELETE FROM boost_list WHERE guild_id = ? AND entry_num = ?",
+            (guild_id, entry_num),
+        )
+        # Renumber remaining entries to be sequential
+        async with bot.db.execute(
+            "SELECT entry_num FROM boost_list WHERE guild_id = ? ORDER BY entry_num ASC",
+            (guild_id,),
+        ) as cursor:
+            remaining = [r[0] for r in await cursor.fetchall()]
+        for new_num, old_num in enumerate(remaining, start=1):
+            if new_num != old_num:
+                await bot.db.execute(
+                    "UPDATE boost_list SET entry_num = ? WHERE guild_id = ? AND entry_num = ?",
+                    (new_num, guild_id, old_num),
+                )
         await bot.db.commit()
     else:
         await bot.db.execute(
-            "UPDATE boost_list SET boost_count = boost_count - 1 WHERE id = ?",
-            (entry_id,),
+            "UPDATE boost_list SET boost_count = boost_count - 1 "
+            "WHERE guild_id = ? AND entry_num = ?",
+            (guild_id, entry_num),
         )
         await bot.db.commit()
     return True
 
 
-# ── Persistent View: "I know who it was" (boost start attribution) ──────
+# ── Persistent View: "Add to boost list" (boost start) ──────────────────
 # Used by cogs.member_events when a member boosts but isn't in the list.
 # The target user_id is stored in the message embed's footer so the same
 # persistent view (registered once at startup) works for every message.
@@ -168,7 +191,7 @@ class BoostListAddView(discord.ui.View):
         super().__init__(timeout=None)  # Persistent
 
     @discord.ui.button(
-        label="I know who it was",
+        label="Add to boost list",
         style=discord.ButtonStyle.secondary,
         custom_id="boost_list_add:click",
     )
@@ -179,7 +202,6 @@ class BoostListAddView(discord.ui.View):
             )
             return
 
-        # Parse target user_id from the embed footer ("User ID: <id>")
         try:
             embed = interaction.message.embeds[0]
             footer_text = embed.footer.text or ""
@@ -207,26 +229,24 @@ class BoostListAddView(discord.ui.View):
         )
         deadline = calculate_next_deadline(boost_since, now_ts)
 
-        entry_id = await add_to_boost_list(
+        entry_num = await add_to_boost_list(
             interaction.client, interaction.guild.id, target_user_id,
-            interaction.user.id, boost_since_ts=boost_since,
-            boost_count=1, deadline_ts=deadline,
+            boost_since_ts=boost_since, deadline_ts=deadline,
         )
-        if entry_id is None:
+        if entry_num is None:
             await interaction.response.send_message(
                 f"❌ {target_member.mention} is already in the boost_list.",
                 ephemeral=True,
             )
             return
 
-        # Update the original embed to reflect the addition
         try:
             embed.color = discord.Color.green()
             embed.add_field(
                 name="Added to boost_list",
                 value=(
                     f"✅ {target_member.mention} added by {interaction.user.mention}\n"
-                    f"Boosts: 1 • Deadline: <t:{deadline}:F>"
+                    f"Entry #{entry_num} • Deadline: <t:{deadline}:F>"
                 ),
                 inline=False,
             )
@@ -236,7 +256,7 @@ class BoostListAddView(discord.ui.View):
 
         await interaction.response.send_message(
             f"✅ Added {target_member.mention} to the boost_list "
-            f"(1 boost, deadline <t:{deadline}:F>).",
+            f"(entry #{entry_num}, deadline <t:{deadline}:F>).",
             ephemeral=True,
         )
 
@@ -246,7 +266,7 @@ class BoostListAddView(discord.ui.View):
 class BoostListPagination(discord.ui.View):
     def __init__(self, entries, guild, author):
         super().__init__(timeout=120)
-        self.entries = entries  # list of (id, user_id, count, since_ts, deadline_ts)
+        self.entries = entries  # (entry_num, user_id, count, since_ts, deadline_ts)
         self.guild = guild
         self.author = author
         self.page = 0
@@ -269,12 +289,12 @@ class BoostListPagination(discord.ui.View):
             embed.description = "No entries on this page."
         else:
             lines = []
-            for entry_id, user_id, count, since_ts, deadline_ts in chunk:
+            for entry_num, user_id, count, since_ts, deadline_ts in chunk:
                 member = self.guild.get_member(user_id)
                 user_str = member.mention if member else f"`{user_id}`"
                 lines.append(
-                    f"**#{entry_id}** • {user_str}\n"
-                    f"Boosts: **{count}** • Since: <t:{since_ts}:D>\n"
+                    f"**#{entry_num}** • {user_str}\n"
+                    f"Boosts: **{count}** • Since: <t:{since_ts}:F>\n"
                     f"Deadline: <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)"
                 )
             embed.description = "\n\n".join(lines)
@@ -317,8 +337,6 @@ class BoostList(commands.Cog):
         self.fire_reminders.start()
 
     async def cog_load(self) -> None:
-        # Register the persistent view so the "I know who it was" button
-        # keeps working after a restart.
         self.bot.add_view(BoostListAddView())
 
     def cog_unload(self):
@@ -327,77 +345,61 @@ class BoostList(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def fire_reminders(self):
-        """Every minute, check boost_list entries for upcoming deadlines.
-
-        - 1-week reminder fires when (deadline - now) <= 7 days and not yet sent.
-        - 3-day reminder fires when (deadline - now) <= 3 days and not yet sent.
-        - Both post to the guild's server-log channel and ping the admin.
-
-        Each reminder is marked as sent via the week_notified / three_day_notified
-        flags so it fires exactly once per annual cycle.
-        """
         now_ts = int(discord.utils.utcnow().timestamp())
         week_cutoff = now_ts + 7 * 86400
         three_day_cutoff = now_ts + 3 * 86400
 
-        # 1-week reminders
         async with self.bot.db.execute(
-            "SELECT id, guild_id, user_id, admin_id, deadline "
-            "FROM boost_list "
+            "SELECT entry_num, guild_id, user_id, deadline FROM boost_list "
             "WHERE deadline <= ? AND deadline > ? AND week_notified = 0",
             (week_cutoff, now_ts),
         ) as cursor:
             due_week = await cursor.fetchall()
 
-        for entry_id, guild_id, user_id, admin_id, deadline_ts in due_week:
-            posted = await _post_reminder(
-                self.bot, guild_id, admin_id, user_id, deadline_ts, "1 week"
-            )
+        for entry_num, guild_id, user_id, deadline_ts in due_week:
+            posted = await _post_reminder(self.bot, guild_id, user_id, deadline_ts, "1 week")
             if posted:
                 await self.bot.db.execute(
-                    "UPDATE boost_list SET week_notified = 1 WHERE id = ?",
-                    (entry_id,),
+                    "UPDATE boost_list SET week_notified = 1 "
+                    "WHERE guild_id = ? AND entry_num = ?",
+                    (guild_id, entry_num),
                 )
                 await self.bot.db.commit()
 
-        # 3-day reminders
         async with self.bot.db.execute(
-            "SELECT id, guild_id, user_id, admin_id, deadline "
-            "FROM boost_list "
+            "SELECT entry_num, guild_id, user_id, deadline FROM boost_list "
             "WHERE deadline <= ? AND deadline > ? AND three_day_notified = 0",
             (three_day_cutoff, now_ts),
         ) as cursor:
             due_3day = await cursor.fetchall()
 
-        for entry_id, guild_id, user_id, admin_id, deadline_ts in due_3day:
-            posted = await _post_reminder(
-                self.bot, guild_id, admin_id, user_id, deadline_ts, "3 days"
-            )
+        for entry_num, guild_id, user_id, deadline_ts in due_3day:
+            posted = await _post_reminder(self.bot, guild_id, user_id, deadline_ts, "3 days")
             if posted:
                 await self.bot.db.execute(
-                    "UPDATE boost_list SET three_day_notified = 1 WHERE id = ?",
-                    (entry_id,),
+                    "UPDATE boost_list SET three_day_notified = 1 "
+                    "WHERE guild_id = ? AND entry_num = ?",
+                    (guild_id, entry_num),
                 )
                 await self.bot.db.commit()
 
     @tasks.loop(hours=1)
     async def refresh_deadlines(self):
-        """For entries whose deadline has passed, advance to next year and
-        reset the notification flags so reminders fire again next cycle."""
         now_ts = int(discord.utils.utcnow().timestamp())
         async with self.bot.db.execute(
-            "SELECT id, guild_id, user_id, admin_id, boost_since "
-            "FROM boost_list WHERE deadline < ?",
+            "SELECT entry_num, guild_id, user_id, boost_since FROM boost_list "
+            "WHERE deadline < ?",
             (now_ts,),
         ) as cursor:
             expired = await cursor.fetchall()
 
-        for entry_id, guild_id, user_id, admin_id, boost_since in expired:
+        for entry_num, guild_id, user_id, boost_since in expired:
             new_deadline = calculate_next_deadline(boost_since, now_ts)
             await self.bot.db.execute(
                 "UPDATE boost_list SET deadline = ?, "
-                "week_notified = 0, three_day_notified = 0 WHERE id = ?",
-                (new_deadline, entry_id),
+                "week_notified = 0, three_day_notified = 0 "
+                "WHERE guild_id = ? AND entry_num = ?",
+                (new_deadline, guild_id, entry_num),
             )
         if expired:
             await self.bot.db.commit()
@@ -420,20 +422,20 @@ class BoostList(commands.Cog):
         if not interaction.guild:
             return []
         async with self.bot.db.execute(
-            "SELECT id, user_id, boost_count, deadline FROM boost_list "
-            "WHERE guild_id = ? ORDER BY deadline ASC",
+            "SELECT entry_num, user_id, boost_count, deadline FROM boost_list "
+            "WHERE guild_id = ? ORDER BY entry_num ASC",
             (interaction.guild.id,),
         ) as cursor:
             rows = await cursor.fetchall()
 
         cl = current.lower()
         results = []
-        for entry_id, user_id, count, deadline_ts in rows:
+        for entry_num, user_id, count, deadline_ts in rows:
             member = interaction.guild.get_member(user_id)
             label_name = member.display_name if member else f"User {user_id}"
-            label = f"#{entry_id} — {label_name} ({count} boost, <t:{deadline_ts}:R>)"
-            if cl in label.lower() or cl in str(user_id) or cl in str(entry_id):
-                results.append(app_commands.Choice(name=label[:100], value=str(entry_id)))
+            label = f"#{entry_num} — {label_name} ({count} boost, <t:{deadline_ts}:R>)"
+            if cl in label.lower() or cl in str(user_id) or cl in str(entry_num):
+                results.append(app_commands.Choice(name=label[:100], value=str(entry_num)))
             if len(results) >= 25:
                 break
         return results
@@ -449,18 +451,30 @@ class BoostList(commands.Cog):
         ) as cursor:
             existing_ids = {row[0] for row in await cursor.fetchall()}
 
+        # Include both actual premium_subscribers AND users tracked in
+        # guild_boosts (which covers simulated boost events)
+        candidate_ids = {m.id for m in interaction.guild.premium_subscribers}
+        async with self.bot.db.execute(
+            "SELECT user_id FROM guild_boosts WHERE guild_id = ?",
+            (interaction.guild.id,),
+        ) as cursor:
+            for row in await cursor.fetchall():
+                candidate_ids.add(row[0])
+
         cl = current.lower()
         results = []
-        for m in interaction.guild.premium_subscribers:
-            if m.id in existing_ids:
+        for uid in candidate_ids:
+            if uid in existing_ids:
                 continue
-            label = f"{m.display_name} ({m.id})"
-            if cl in label.lower() or cl in str(m.id):
-                results.append(app_commands.Choice(name=label[:100], value=str(m.id)))
+            member = interaction.guild.get_member(uid)
+            if member is None:
+                continue
+            label = f"{member.display_name} ({member.id})"
+            if cl in label.lower() or cl in str(uid):
+                results.append(app_commands.Choice(name=label[:100], value=str(uid)))
             if len(results) >= 25:
                 break
         return results
-
     @boost_list.command(name="list", description="Show all tracked boosters and their deadlines")
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
@@ -468,8 +482,8 @@ class BoostList(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         async with self.bot.db.execute(
-            "SELECT id, user_id, boost_count, boost_since, deadline "
-            "FROM boost_list WHERE guild_id = ? ORDER BY deadline ASC",
+            "SELECT entry_num, user_id, boost_count, boost_since, deadline "
+            "FROM boost_list WHERE guild_id = ? ORDER BY entry_num ASC",
             (interaction.guild.id,),
         ) as cursor:
             entries = await cursor.fetchall()
@@ -489,24 +503,17 @@ class BoostList(commands.Cog):
     @boost_list.command(name="add", description="Add a currently-boosting user to the boost list")
     @app_commands.describe(
         user="Pick a current booster (autocomplete shows non-tracked boosters)",
-        boost_count="Number of boosts to record (default 1, min 1)",
     )
     @app_commands.autocomplete(user=_booster_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
     async def add_cmd(
-        self, interaction: discord.Interaction, user: str, boost_count: int = 1
+        self, interaction: discord.Interaction, user: str
     ):
         try:
             user_id = int(user)
         except ValueError:
             await interaction.response.send_message("❌ Invalid user.", ephemeral=True)
-            return
-
-        if boost_count < 1:
-            await interaction.response.send_message(
-                "❌ Boost count must be at least 1.", ephemeral=True
-            )
             return
 
         member = interaction.guild.get_member(user_id)
@@ -524,11 +531,11 @@ class BoostList(commands.Cog):
         )
         deadline = calculate_next_deadline(boost_since, now_ts)
 
-        entry_id = await add_to_boost_list(
-            self.bot, interaction.guild.id, user_id, interaction.user.id,
-            boost_since_ts=boost_since, boost_count=boost_count, deadline_ts=deadline,
+        entry_num = await add_to_boost_list(
+            self.bot, interaction.guild.id, user_id,
+            boost_since_ts=boost_since, deadline_ts=deadline,
         )
-        if entry_id is None:
+        if entry_num is None:
             await interaction.response.send_message(
                 f"❌ {member.mention} is already in the boost_list. "
                 f"Use `/boost_list edit` to change their boost count.",
@@ -538,8 +545,8 @@ class BoostList(commands.Cog):
 
         await interaction.response.send_message(
             f"✅ Added {member.mention} to the boost_list:\n"
-            f"• Boosts: **{boost_count}**\n"
-            f"• Since: <t:{boost_since}:D>\n"
+            f"• Entry #{entry_num}\n"
+            f"• Since: <t:{boost_since}:F>\n"
             f"• Deadline: <t:{deadline}:F> (<t:{deadline}:R>)\n"
             f"• You'll be pinged in the server-log channel "
             f"1 week and 3 days before the deadline.",
@@ -548,15 +555,15 @@ class BoostList(commands.Cog):
 
     @boost_list.command(name="edit", description="Edit an existing boost list entry")
     @app_commands.describe(
-        entry_id="Entry ID from /boost_list list",
+        entry_num="Entry number from /boost_list list",
         boost_count="New boost count (min 1; leave empty to keep current)",
         deadline="New deadline (e.g. '2027-05-05' or 'May 5 2027'); leave empty to keep",
     )
-    @app_commands.autocomplete(entry_id=_entry_autocomplete)
+    @app_commands.autocomplete(entry_num=_entry_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
     async def edit_cmd(
-        self, interaction: discord.Interaction, entry_id: int,
+        self, interaction: discord.Interaction, entry_num: int,
         boost_count: int | None = None, deadline: str | None = None,
     ):
         if boost_count is None and (deadline is None or not deadline.strip()):
@@ -573,32 +580,28 @@ class BoostList(commands.Cog):
             return
 
         async with self.bot.db.execute(
-            "SELECT id, guild_id, user_id, boost_count, boost_since, deadline "
-            "FROM boost_list WHERE id = ?",
-            (entry_id,),
+            "SELECT guild_id, user_id, boost_count, boost_since, deadline "
+            "FROM boost_list WHERE guild_id = ? AND entry_num = ?",
+            (interaction.guild.id, entry_num),
         ) as cursor:
             row = await cursor.fetchone()
 
-        if row is None or row[1] != interaction.guild.id:
+        if row is None:
             await interaction.response.send_message(
                 "❌ Entry not found in this server.", ephemeral=True
             )
             return
 
-        (
-            _id, guild_id, user_id, current_count,
-            boost_since, current_deadline,
-        ) = row
+        guild_id, user_id, current_count, boost_since, current_deadline = row
 
-        # Update boost_count
         if boost_count is not None:
             await self.bot.db.execute(
-                "UPDATE boost_list SET boost_count = ? WHERE id = ?",
-                (boost_count, entry_id),
+                "UPDATE boost_list SET boost_count = ? "
+                "WHERE guild_id = ? AND entry_num = ?",
+                (boost_count, guild_id, entry_num),
             )
             await self.bot.db.commit()
 
-        # Update deadline + reset notification flags so reminders re-fire
         new_deadline_ts = current_deadline
         deadline_changed = False
         if deadline is not None and deadline.strip():
@@ -617,8 +620,9 @@ class BoostList(commands.Cog):
             new_deadline_ts = int(parsed.timestamp())
             await self.bot.db.execute(
                 "UPDATE boost_list SET deadline = ?, "
-                "week_notified = 0, three_day_notified = 0 WHERE id = ?",
-                (new_deadline_ts, entry_id),
+                "week_notified = 0, three_day_notified = 0 "
+                "WHERE guild_id = ? AND entry_num = ?",
+                (new_deadline_ts, guild_id, entry_num),
             )
             await self.bot.db.commit()
             deadline_changed = True
@@ -627,7 +631,7 @@ class BoostList(commands.Cog):
         user_str = member.mention if member else f"`{user_id}`"
         final_count = boost_count if boost_count is not None else current_count
         await interaction.response.send_message(
-            f"✅ Updated entry #{entry_id} ({user_str}):\n"
+            f"✅ Updated entry #{entry_num} ({user_str}):\n"
             f"• Boosts: **{final_count}**\n"
             f"• Deadline: <t:{new_deadline_ts}:F> (<t:{new_deadline_ts}:R>)"
             + ("\n• Reminder flags reset (reminders will re-fire)." if deadline_changed else ""),
@@ -635,31 +639,47 @@ class BoostList(commands.Cog):
         )
 
     @boost_list.command(name="delete", description="Remove a user from the boost list")
-    @app_commands.describe(entry_id="Entry ID from /boost_list list")
-    @app_commands.autocomplete(entry_id=_entry_autocomplete)
+    @app_commands.describe(entry_num="Entry number from /boost_list list")
+    @app_commands.autocomplete(entry_num=_entry_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.guild_only()
-    async def delete_cmd(self, interaction: discord.Interaction, entry_id: int):
+    async def delete_cmd(self, interaction: discord.Interaction, entry_num: int):
         async with self.bot.db.execute(
-            "SELECT guild_id, user_id FROM boost_list WHERE id = ?",
-            (entry_id,),
+            "SELECT user_id FROM boost_list WHERE guild_id = ? AND entry_num = ?",
+            (interaction.guild.id, entry_num),
         ) as cursor:
             row = await cursor.fetchone()
 
-        if row is None or row[0] != interaction.guild.id:
+        if row is None:
             await interaction.response.send_message(
                 "❌ Entry not found in this server.", ephemeral=True
             )
             return
 
-        guild_id, user_id = row
-        await self.bot.db.execute("DELETE FROM boost_list WHERE id = ?", (entry_id,))
+        user_id = row[0]
+        await self.bot.db.execute(
+            "DELETE FROM boost_list WHERE guild_id = ? AND entry_num = ?",
+            (interaction.guild.id, entry_num),
+        )
+        # Renumber remaining entries to be sequential starting from 1
+        async with self.bot.db.execute(
+            "SELECT entry_num FROM boost_list WHERE guild_id = ? ORDER BY entry_num ASC",
+            (interaction.guild.id,),
+        ) as cursor:
+            remaining = [r[0] for r in await cursor.fetchall()]
+        for new_num, old_num in enumerate(remaining, start=1):
+            if new_num != old_num:
+                await self.bot.db.execute(
+                    "UPDATE boost_list SET entry_num = ? "
+                    "WHERE guild_id = ? AND entry_num = ?",
+                    (new_num, interaction.guild.id, old_num),
+                )
         await self.bot.db.commit()
 
         member = interaction.guild.get_member(user_id)
         user_str = member.mention if member else f"`{user_id}`"
         await interaction.response.send_message(
-            f"✅ Removed {user_str} from the boost list (entry #{entry_id}).",
+            f"✅ Removed {user_str} from the boost list (entry #{entry_num}).",
             ephemeral=True,
         )
 

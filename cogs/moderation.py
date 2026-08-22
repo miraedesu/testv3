@@ -533,6 +533,8 @@ class Moderation(commands.Cog):
             return
         if not payload.data["pinned"]:
             return
+        if await is_feature_disabled(self.bot, payload.guild_id, "pinboard"):
+            return
         if payload.message_id in self._logged_pins:  # Already logged
             return
         self._logged_pins.add(payload.message_id)
