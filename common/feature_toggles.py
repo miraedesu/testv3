@@ -139,14 +139,29 @@ async def list_disabled_features(
 
 async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
     """On startup, ensure opt-in features obey the code config.
-    1. Wipe enabled_features rows for opt-in features that weren't bot-owner-enabled
+
+    1. De-duplicate rows where channel_id IS NULL (SQLite treats NULL as
+       distinct in PRIMARY KEY, so NULL-channel_id duplicates accumulate
+       across restarts).
+    2. Wipe enabled_features rows for opt-in features that weren't bot-owner-enabled
        (cleans up falsely-enabled rows from before OPT_IN enforcement existed).
-    2. Write a bot_owner-locked disabled_features row for any opt-in feature that
-       is not currently enabled — blocks guild admins from enabling it."""
+    3. Write a bot_owner-locked disabled_features row for any opt-in feature that
+       is not currently enabled — blocks guild admins from enabling it.
+       Uses NOT EXISTS instead of INSERT OR IGNORE because the latter doesn't
+       dedupe NULL channel_id rows.
+    """
     await _ensure_disabled_by_column(bot)
     await _ensure_enabled_by_column(bot)
 
-    # 1. Wipe falsely-enabled opt-in rows (enabled_by is NULL or != 'bot_owner')
+    # 1. De-duplicate NULL-channel_id rows (one-time + ongoing safety)
+    await bot.db.execute(
+        "DELETE FROM disabled_features WHERE rowid NOT IN ("
+        "  SELECT MIN(rowid) FROM disabled_features "
+        "  GROUP BY guild_id, feature_name, COALESCE(channel_id, -1)"
+        ")"
+    )
+
+    # 2. Wipe falsely-enabled opt-in rows (enabled_by is NULL or != 'bot_owner')
     if OPT_IN_FEATURES:
         placeholders = ",".join("?" for _ in OPT_IN_FEATURES)
         await bot.db.execute(
@@ -156,7 +171,7 @@ async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
             tuple(OPT_IN_FEATURES),
         )
 
-    # 2. Lock down opt-in features not in enabled_features for every guild
+    # 3. Lock down opt-in features not in enabled_features for every guild
     for guild in bot.guilds:
         async with bot.db.execute(
             "SELECT feature_name FROM enabled_features WHERE guild_id = ?",
@@ -166,10 +181,18 @@ async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
 
         for feature in OPT_IN_FEATURES:
             if feature not in enabled:
+                # NOT EXISTS check — works for NULL channel_id (unlike INSERT OR IGNORE)
                 await bot.db.execute(
-                    "INSERT OR IGNORE INTO disabled_features "
-                    "(guild_id, feature_name, channel_id, disabled_by) VALUES (?, ?, NULL, 'bot_owner')",
-                    (guild.id, feature),
+                    "INSERT INTO disabled_features "
+                    "(guild_id, feature_name, channel_id, disabled_by) "
+                    "SELECT ?, ?, NULL, 'bot_owner' "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM disabled_features "
+                    "  WHERE guild_id = ? AND feature_name = ? AND channel_id IS NULL"
+                    ")",
+                    (guild.id, feature, guild.id, feature),
                 )
+
+    await bot.db.commit()
 
     await bot.db.commit()

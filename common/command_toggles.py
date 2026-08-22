@@ -117,12 +117,24 @@ async def list_disabled_commands(
 
 async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
     """On startup, ensure opt-in commands obey the code config.
-    1. Wipe enabled_commands rows for opt-in commands that weren't bot-owner-enabled.
-    2. Write a bot_owner-locked disabled_commands row for any opt-in command
-       that is not currently enabled."""
+
+    1. De-duplicate NULL-channel_id rows (SQLite treats NULL as distinct in PK).
+    2. Wipe enabled_commands rows for opt-in commands that weren't bot-owner-enabled.
+    3. Write a bot_owner-locked disabled_commands row for any opt-in command
+       that is not currently enabled — uses NOT EXISTS instead of INSERT OR IGNORE
+       because the latter doesn't dedupe NULL channel_id."""
     await _ensure_disabled_by_column(bot)
     await _ensure_enabled_by_column(bot)
 
+    # 1. De-duplicate NULL-channel_id rows
+    await bot.db.execute(
+        "DELETE FROM disabled_commands WHERE rowid NOT IN ("
+        "  SELECT MIN(rowid) FROM disabled_commands "
+        "  GROUP BY guild_id, command_name, COALESCE(channel_id, -1)"
+        ")"
+    )
+
+    # 2. Wipe falsely-enabled opt-in rows
     if OPT_IN_COMMANDS:
         placeholders = ",".join("?" for _ in OPT_IN_COMMANDS)
         await bot.db.execute(
@@ -132,6 +144,7 @@ async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
             tuple(OPT_IN_COMMANDS),
         )
 
+    # 3. Lock down opt-in commands not in enabled_commands for every guild
     for guild in bot.guilds:
         async with bot.db.execute(
             "SELECT command_name FROM enabled_commands WHERE guild_id = ?",
@@ -142,9 +155,16 @@ async def enforce_opt_in_lockdown(bot: commands.Bot) -> None:
         for command in OPT_IN_COMMANDS:
             if command not in enabled:
                 await bot.db.execute(
-                    "INSERT OR IGNORE INTO disabled_commands "
-                    "(guild_id, command_name, channel_id, disabled_by) VALUES (?, ?, NULL, 'bot_owner')",
-                    (guild.id, command),
+                    "INSERT INTO disabled_commands "
+                    "(guild_id, command_name, channel_id, disabled_by) "
+                    "SELECT ?, ?, NULL, 'bot_owner' "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM disabled_commands "
+                    "  WHERE guild_id = ? AND command_name = ? AND channel_id IS NULL"
+                    ")",
+                    (guild.id, command, guild.id, command),
                 )
+
+    await bot.db.commit()
 
     await bot.db.commit()
