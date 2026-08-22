@@ -20,7 +20,6 @@ from common.feature_toggles import is_feature_disabled
 # boost/unboost event doesn't get logged twice by two different handlers
 # that both react to the same underlying change.
 logger = logging.getLogger(__name__)
-import re
 
 def _parse_booster_id(text: str, guild: discord.Guild) -> int | None:
     """Resolve a user ID from a mention, raw ID, or guild nickname/username."""
@@ -649,53 +648,6 @@ class MemberEvents(commands.Cog):
             await server_log_channel.send(embed=embed)
         except discord.Forbidden:
             logger.info(f"Permission Denied: Cannot send logs to #{server_log_channel.name}")
-
-        # --- Boost list auto-update (only if boost_list cog is installed) ---
-        # Increment/decrement the existing entry's count. If a NEW booster
-        # isn't in the list yet, post an attribution embed with an
-        # "I know who it was" button so the admin can add them with defaults.
-        try:
-            from cogs.boost_list import (
-                increment_boost_count,
-                decrement_boost_count,
-                BoostListAddView,
-            )
-            boost_list_installed = True
-        except ImportError:
-            boost_list_installed = False
-
-        attribution_pending = False
-        if boost_list_installed:
-            if started_boosting:
-                if not await increment_boost_count(self.bot, after.guild.id, after.id):
-                    attribution_pending = True
-            else:  # stopped_boosting
-                await decrement_boost_count(self.bot, after.guild.id, after.id)
-
-        if attribution_pending and server_log_channel is not None:
-            attr_embed = discord.Embed(
-                title="<:boost:1534195799892955176> Boost List Update Needed",
-                description=(
-                    f"{after.mention} just boosted but isn't in the boost_list yet.\n"
-                    f"Click **I know who it was** below to add them with default "
-                    f"settings (1 boost, deadline = next annual anniversary)."
-                ),
-                color=discord.Color.gold(),
-                timestamp=discord.utils.utcnow(),
-            )
-            attr_embed.add_field(
-                name="User", value=f"{after} (`{after.id}`)", inline=False
-            )
-            attr_embed.set_thumbnail(url=after.display_avatar.url)
-            # Footer is read by the persistent view's click handler to know
-            # which user to add. Format MUST be "User ID: <id>".
-            attr_embed.set_footer(text=f"User ID: {after.id}")
-            try:
-                await server_log_channel.send(
-                    embed=attr_embed, view=BoostListAddView()
-                )
-            except discord.Forbidden:
-                pass
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Track joins for the whois command."""

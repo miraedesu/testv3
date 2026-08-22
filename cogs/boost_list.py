@@ -5,10 +5,10 @@ annual deadline (next (month, day) anniversary of when they started boosting).
 Two reminders are posted to the guild's "server-log" channel 1 week and 3
 days before each booster's deadline.
 
-Auto-tracking: when a `on_member_update` boost event fires, the boost_count
-of an existing entry is incremented/decremented automatically. If a member
-starts boosting but isn't in the list yet, an embed is posted with an
-"Add to boost list" button so the admin can add them with defaults.
+Boost list entries are managed manually via /boost_list commands. When a
+boost removal is attributed via the 'I know who it was' button or
+/guild_settings boost_edit, the attributed user's boost_count is
+decremented automatically.
 """
 from __future__ import annotations
 
@@ -143,18 +143,6 @@ async def add_to_boost_list(
         return None
     return entry_num
 
-
-async def increment_boost_count(bot, guild_id: int, user_id: int) -> bool:
-    """Increment boost_count for an existing entry. Returns True if found."""
-    cursor = await bot.db.execute(
-        "UPDATE boost_list SET boost_count = boost_count + 1 "
-        "WHERE guild_id = ? AND user_id = ?",
-        (guild_id, user_id),
-    )
-    await bot.db.commit()
-    return cursor.rowcount > 0
-
-
 async def decrement_boost_count(bot, guild_id: int, user_id: int) -> bool:
     """Decrement boost_count. If it would drop to 0, delete the entry and
     renumber remaining entries. Returns True if an entry was found."""
@@ -194,86 +182,6 @@ async def decrement_boost_count(bot, guild_id: int, user_id: int) -> bool:
         )
         await bot.db.commit()
     return True
-
-
-# ── Persistent View: "Add to boost list" (boost start) ──────────────────
-# Used by cogs.member_events when a member boosts but isn't in the list.
-# The target user_id is stored in the message embed's footer so the same
-# persistent view (registered once at startup) works for every message.
-
-class BoostListAddView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # Persistent
-
-    @discord.ui.button(
-        label="Add to boost list",
-        style=discord.ButtonStyle.secondary,
-        custom_id="boost_list_add:click",
-    )
-    async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message(
-                "❌ Only server admins can do this.", ephemeral=True
-            )
-            return
-
-        try:
-            embed = interaction.message.embeds[0]
-            footer_text = embed.footer.text or ""
-            target_user_id = int(footer_text.split("User ID: ")[1])
-        except (IndexError, ValueError):
-            await interaction.response.send_message(
-                "❌ Couldn't determine which user to add (embed footer missing).",
-                ephemeral=True,
-            )
-            return
-
-        target_member = interaction.guild.get_member(target_user_id)
-        if target_member is None:
-            await interaction.response.send_message(
-                "❌ That user is no longer in this server — can't add to boost_list.",
-                ephemeral=True,
-            )
-            return
-
-        now_ts = int(discord.utils.utcnow().timestamp())
-        boost_since = (
-            int(target_member.premium_since.timestamp())
-            if target_member.premium_since
-            else now_ts
-        )
-        deadline = calculate_next_deadline(boost_since, now_ts)
-
-        entry_num = await add_to_boost_list(
-            interaction.client, interaction.guild.id, target_user_id,
-            boost_since_ts=boost_since, deadline_ts=deadline,
-        )
-        if entry_num is None:
-            await interaction.response.send_message(
-                f"❌ {target_member.mention} is already in the boost_list.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            embed.color = discord.Color.green()
-            embed.add_field(
-                name="Added to boost_list",
-                value=(
-                    f"✅ {target_member.mention} added by {interaction.user.mention}\n"
-                    f"Entry #{entry_num} • Deadline: <t:{deadline}:F>"
-                ),
-                inline=False,
-            )
-            await interaction.message.edit(embed=embed)
-        except (discord.NotFound, discord.Forbidden):
-            pass
-
-        await interaction.response.send_message(
-            f"✅ Added {target_member.mention} to the boost_list "
-            f"(entry #{entry_num}, deadline <t:{deadline}:F>).",
-            ephemeral=True,
-        )
 
 
 # ── Pagination for /boost_list list ─────────────────────────────────────
@@ -352,7 +260,7 @@ class BoostList(commands.Cog):
         self.fire_reminders.start()
 
     async def cog_load(self) -> None:
-        self.bot.add_view(BoostListAddView())
+        pass
 
     def cog_unload(self):
         self.refresh_deadlines.cancel()
