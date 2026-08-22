@@ -30,18 +30,32 @@ PLACEHOLDER_RE = re.compile(r"%(\w+)%")
 
 # Features that require explicit enabling per server
 OPT_IN_FEATURES = {
-    "welcome_card",
-    "automod_masked_links",
-    "automod_non_member_links",
+    # "welcome_card",
+    # "automod_masked_links",
+    # "automod_non_member_links",
     "automod_spam_detection",
-    "twitter_fix",
+    # "twitter_fix",
     "message_log",
-    "custom_reactions",
+    # "custom_reactions",
+    "pinboard",
+    # "boost_tracker",
+    # "channel_layout_screenshot",
+    # "member_leave_log",
+    # "role_change_log",
+    # "channel_permission_log",
 }
 OPT_IN_COMMANDS = {
     "test",
     "whois",
+    "whois_add",
+    "whois_del",
+    "whois_list"
     "cr",
+    "emote",
+    "guild_settings boost_edit",
+    "guild_settings boost_list_mention",
+    "guild_settings boost_list_mention_view",
+    "guild_settings boost_list_mention_clear",
 }
 
 # ---- Moderation ----
@@ -168,8 +182,13 @@ FEATURE_CHOICES_DATA = [
     ("Message Log (delete/edits)", "message_log"),
     ("Custom Reactions", "custom_reactions"),
     ("Username Update Log", "username_update_log"),
+    ("Pinboard", "pinboard"),
+    ("Boost Tracker", "boost_tracker"),
+    ("Channel Layout Snapshots", "channel_layout_screenshot"),
+    ("Member Leave/Kick/Ban Log", "member_leave_log"),
+    ("Role Change Log", "role_change_log"),
+    ("Channel Permission Log", "channel_permission_log"),
 ]
-
 
 def friendly_permission_name(name: str) -> str:
     """Looks up a discord.py permission flag's current Discord UI label.
