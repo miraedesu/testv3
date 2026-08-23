@@ -30,14 +30,14 @@ PLACEHOLDER_RE = re.compile(r"%(\w+)%")
 
 # Features that require explicit enabling per server
 OPT_IN_FEATURES = {
-    # "welcome_card",
-    # "automod_masked_links",
-    # "automod_non_member_links",
-    "automod_spam_detection",
-    # "twitter_fix",
-    "message_log",
-    # "custom_reactions",
-    "pinboard",
+    "welcome_card",
+    "automod_masked_links",
+    "automod_non_member_links",
+    # "automod_spam_detection",
+    "twitter_fix",
+    # "message_log",
+    "custom_reactions",
+    # "pinboard",
     # "boost_tracker",
     # "channel_layout_screenshot",
     # "member_leave_log",
@@ -57,7 +57,6 @@ OPT_IN_COMMANDS = {
     "guild_settings boost_list_mention_view",
     "guild_settings boost_list_mention_clear",
     "uwulock",
-
 }
 
 # ---- Moderation ----
