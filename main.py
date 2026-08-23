@@ -48,14 +48,32 @@ class OwnerToggleableCommandTree(app_commands.CommandTree):
             return True
 
         qualified_name = interaction.command.qualified_name
+
+        #--- Opt-in / disabled check ---
         if await is_command_disabled(self.client, interaction.guild_id, qualified_name, interaction.channel_id):
             await interaction.response.send_message(
                 f"`/{qualified_name}` is disabled in this server or channel.",
                 ephemeral=True,
             )
             return False
-        return True
 
+        #--- Enforce default_permissions server-side (Integration tab bypass protection) ---
+        cmd = interaction.command
+        while cmd.parent is not None:
+            cmd = cmd.parent
+
+        required_perms = cmd.default_permissions
+        if required_perms is not None:
+            user_perms = interaction.user.guild_permissions
+            # Administrators bypass, otherwise check the bitfield
+            if not user_perms.administrator and not (user_perms.value & required_perms.value):
+                await interaction.response.send_message(
+                    "You don't have permission to use this command.",
+                    ephemeral=True,
+                )
+                return False
+
+        return True
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents,
@@ -90,7 +108,7 @@ class MyBot(commands.Bot):
             cogs_to_load = [
                 "cogs.reactions", "cogs.settings", "cogs.welcome", "cogs.emotes",
                 "cogs.moderation", "cogs.member_events", "cogs.permcheck", "cogs.admin",
-                "cogs.anime", "cogs.profile", "cogs.whois", "cogs.misc", "cogs.guild_settings", "cogs.bot_log","cogs.boost_list",
+                "cogs.anime", "cogs.profile", "cogs.whois", "cogs.misc", "cogs.guild_settings", "cogs.bot_log","cogs.boost_list","cogs.uwu",
             ]
             # Save defaults to DB
             await self.db.executemany("INSERT OR IGNORE INTO enabled_cogs (cog_name) VALUES (?)", [(c,) for c in cogs_to_load])
