@@ -56,6 +56,8 @@ OPT_IN_COMMANDS = {
     "guild_settings boost_list_mention",
     "guild_settings boost_list_mention_view",
     "guild_settings boost_list_mention_clear",
+    "uwulock",
+
 }
 
 # ---- Moderation ----
