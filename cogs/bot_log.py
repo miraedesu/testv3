@@ -176,12 +176,12 @@ class BotLog(commands.Cog):
         if interaction.guild:
             location = f"{interaction.guild.name} (`{interaction.guild.id}`)"
             if interaction.channel:
-                location += f"\n📍 {interaction.channel.mention}"
+                location += f"\n<:text_channel:1534196045616124054> {interaction.channel.mention}"
         else:
             location = "DM"
 
         embed = discord.Embed(
-            title=f"🔧 Command Used: `/{command_path}`",
+            title=f"<:search:1534195860123156582> Command Used: `/{command_path}`",
             color=discord.Color.blurple(),
             timestamp=discord.utils.utcnow(),
         )
@@ -259,16 +259,16 @@ class BotLog(commands.Cog):
         if message.guild:
             channel_value = f"{message.channel.mention} (`{message.channel.id}`)"
             log_embed.add_field(
-                name="📍 Channel",
+                name="<:text_channel:1534196045616124054> Channel",
                 value=channel_value,
                 inline=False,
             )
         else:
-            log_embed.add_field(name="📍 Channel", value="DM channel", inline=False)
+            log_embed.add_field(name="<:text_channel:1534196045616124054> Channel", value="DM channel", inline=False)
 
         # Sent timestamp — renders as a live Discord timestamp in fields
         log_embed.add_field(
-            name="🕒 Sent",
+            name="<:alarm:1534195779810365530> Sent",
             value=f"<t:{sent_ts}:F> (<t:{sent_ts}:R>)",
             inline=False,
         )

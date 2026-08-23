@@ -281,6 +281,24 @@ class Database(commands.Cog):
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
+        # --- Wuthering Waves pull history ---
+        # await db.execute("""
+        #     CREATE TABLE IF NOT EXISTS wuwa_pulls (
+        #         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        #         user_id INTEGER NOT NULL,
+        #         card_pool_id TEXT NOT NULL,
+        #         banner_type INTEGER,
+        #         item_id TEXT,
+        #         item_name TEXT NOT NULL,
+        #         rarity INTEGER NOT NULL,
+        #         pulled_at_unix INTEGER NOT NULL,
+        #         source TEXT NOT NULL
+        #     )
+        # """)
+        # await db.execute(
+        #     "CREATE INDEX IF NOT EXISTS idx_wuwa_pulls_user "
+        #     "ON wuwa_pulls (user_id, pulled_at_unix)"
+        # )
         # --- Boost List (per-guild sequential entry numbers) ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS boost_list (
