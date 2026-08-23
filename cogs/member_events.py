@@ -14,12 +14,9 @@ from common.constants import bannedimg, friendly_permission_name, kickimg, leave
 from common.settings_store import get_log_channel
 from common.feature_toggles import is_feature_disabled
 
-
-
-# Tracks the last boost-count change already logged per guild, so a single
-# boost/unboost event doesn't get logged twice by two different handlers
-# that both react to the same underlying change.
 logger = logging.getLogger(__name__)
+
+#--- Boost attribution helpers ---
 
 def _parse_booster_id(text: str, guild: discord.Guild) -> int | None:
     """Resolve a user ID from a mention, raw ID, or guild nickname/username."""
@@ -36,9 +33,6 @@ def _parse_booster_id(text: str, guild: discord.Guild) -> int | None:
 async def apply_boost_attribution(
     bot, message: discord.Message, user_id: int, admin: discord.User, guild: discord.Guild,
 ) -> bool:
-    """Transform a 'Boost Count Changed' embed into a 'Boost Removed' embed,
-    remove the attribution button, and decrement the user's boost_list entry
-    if they're in it. Returns True on success."""
     member = guild.get_member(user_id)
 
     embed = discord.Embed(
@@ -75,8 +69,9 @@ async def apply_boost_attribution(
         pass
     return True
 
-
+#--- Boost attribution UI ---
 class BoostAttributionModal(discord.ui.Modal, title="Attribute Boost Removal"):
+    """Modal asking 'who unboosted?' — resolves to a user ID."""
     booster_name = discord.ui.TextInput(
         label="Who unboosted? (user ID, @mention, or name)",
         placeholder="e.g. @john, john, or 123456789012345678",
@@ -115,6 +110,7 @@ class BoostAttributionModal(discord.ui.Modal, title="Attribute Boost Removal"):
                 ephemeral=True,
             )
 class BoostAttributionView(discord.ui.View):
+    """Persistent button view — opens BoostAttributionModal on click."""
     def __init__(self):
         super().__init__(timeout=None)  # Persistent — no expiry
 
@@ -138,8 +134,11 @@ class BoostAttributionView(discord.ui.View):
             admin=interaction.user,
         )
         await interaction.response.send_modal(modal)
+
+#--- Permission diff helpers ---
+
 def diff_permissions(before: discord.Permissions, after: discord.Permissions) -> tuple[list[str], list[str]]:
-    """Returns (granted, revoked) permission names between two Permissions."""
+    """Return (granted, revoked) permission names."""
     before_perms = dict(before)
     after_perms = dict(after)
     granted = [name for name, value in after_perms.items() if value and not before_perms.get(name)]
@@ -148,8 +147,7 @@ def diff_permissions(before: discord.Permissions, after: discord.Permissions) ->
 
 
 def describe_overwrite_value(value: bool | None) -> str:
-    """Renders a PermissionOverwrite's tri-state value (True/False/None) as
-    Allow/Deny/Neutral, matching Discord's own UI language for overwrites."""
+    """Map tri-state overwrite to Allow/Deny/Neutral."""
     if value is True:
         return "Allow"
     elif value is False:
@@ -157,7 +155,7 @@ def describe_overwrite_value(value: bool | None) -> str:
     return "Neutral"
 
 
-
+#--- Cog: MemberEvents ---
 
 class MemberEvents(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -166,12 +164,14 @@ class MemberEvents(commands.Cog):
         self._snapshot_timers = {}
         self._last_layout = {}
 
+    #--- Startup: boost sync + persistent view ---
+
     async def cog_load(self) -> None:
-        """On startup: sync DB boost state and register persistent views."""
+        """Register persistent views + background boost sync."""
         self.bot.add_view(BoostAttributionView())
         asyncio.create_task(self._sync_all_boosts())
     def cog_unload(self):
-        """Cancel any pending snapshot debounce timers."""
+        """Cancel snapshot debounce timers."""
         for task in self._snapshot_timers.values():
             task.cancel()
         self._snapshot_timers.clear()

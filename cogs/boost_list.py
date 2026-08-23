@@ -218,7 +218,7 @@ class BoostListPagination(discord.ui.View):
                 lines.append(
                     f"**#{entry_num}** • {user_str}\n"
                     f"Boosts: **{count}** • Since: <t:{since_ts}:F>\n"
-                    f"Deadline: <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)"
+                    f"Expiring: <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)"
                 )
             embed.description = "\n\n".join(lines)
 
@@ -477,7 +477,7 @@ class BoostList(commands.Cog):
             f"✅ Added {member.mention} to the boost_list:\n"
             f"• Entry #{entry_num}\n"
             f"• Since: <t:{boost_since}:F>\n"
-            f"• Deadline: <t:{deadline}:F> (<t:{deadline}:R>)\n"
+            f"• Expiring: <t:{deadline}:F> (<t:{deadline}:R>)\n"
             f"• You'll be pinged in the server-log channel "
             f"1 week and 3 days before the deadline.",
             ephemeral=True,
@@ -563,7 +563,7 @@ class BoostList(commands.Cog):
         await interaction.response.send_message(
             f"✅ Updated entry #{entry_num} ({user_str}):\n"
             f"• Boosts: **{final_count}**\n"
-            f"• Deadline: <t:{new_deadline_ts}:F> (<t:{new_deadline_ts}:R>)"
+            f"• Expiring: <t:{new_deadline_ts}:F> (<t:{new_deadline_ts}:R>)"
             + ("\n• Reminder flags reset (reminders will re-fire)." if deadline_changed else ""),
             ephemeral=True,
         )
