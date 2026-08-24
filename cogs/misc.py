@@ -1610,6 +1610,57 @@ class Misc(commands.Cog):
         embed.set_thumbnail(url="attachment://wise.png")
         embed.set_footer(text="Powered by Wise.com")
         await interaction.followup.send(embed=embed, file=file)
+    @app_commands.command(
+        name="choose",
+        description="Remember to use \",\" to separate your choices."
+    )
+    @app_commands.describe(choices="Remember to use \",\" to separate your choices, e.g. \"pizza, sushi, burgers\"")
+    async def choose(self, interaction: discord.Interaction, choices: str):
+        # Split on comma, strip whitespace, drop empties
+        options = [c.strip() for c in choices.split(",") if c.strip()]
+        if len(options) < 2:
+            await interaction.response.send_message(
+                "Give me at least two choices separated by commas.\n"
+                "Example: `/choose pizza, sushi, burgers`",
+                ephemeral=True,
+            )
+            return
+        pick = random.choice(options)
+        await interaction.response.send_message(
+            f"**{interaction.user.display_name}**, \"{pick}\" is the best choice"
+        )
 
+    @app_commands.command(
+        name="random",
+        description="Get a random number, use \"-\" to separate. Only integer numbers."
+    )
+    @app_commands.describe(number="Two integers separated by \"-\", e.g. \"1-100\" or \"50-10\"")
+    async def random_number(self, interaction: discord.Interaction, number: str):
+        # Split on "-"
+        parts = [p.strip() for p in number.split("-") if p.strip()]
+        if len(parts) != 2:
+            await interaction.response.send_message(
+                "Use the format `min-max` (integers only).\n"
+                "Examples: `/random 1-100`, `/random 50-10`",
+                ephemeral=True,
+            )
+            return
+        # Validate both are integers (no floats, no decimals)
+        try:
+            a = int(parts[0])
+            b = int(parts[1])
+        except ValueError:
+            await interaction.response.send_message(
+                "Both ends must be integers (no decimals).\n"
+                "Examples: `/random 1-100`, `/random -5-5`",
+                ephemeral=True,
+            )
+            return
+        # Order doesn't matter — random.randint handles min/max either way
+        low, high = (a, b) if a <= b else (b, a)
+        result = random.randint(low, high)
+        await interaction.response.send_message(
+            f"**{interaction.user.display_name}**, your number: **{result}**"
+        )
 async def setup(bot: commands.Bot):
     await bot.add_cog(Misc(bot))

@@ -14,6 +14,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from common.safeguard import bot_can_webhook_send
 from common.reaction_helpers import pick_random_phrase
 from common.settings_store import (
     clear_guild_setting,
@@ -293,7 +294,8 @@ async def _get_webhook(
     try:
         webhooks = await channel.webhooks()
         for wh in webhooks:
-            if wh.name == WEBHOOK_NAME:
+            #--- Only trust webhooks created by the bot itself ---
+            if wh.name == WEBHOOK_NAME and wh.user is not None and wh.user.id == channel.guild.me.id:
                 _webhook_cache[channel.id] = wh
                 return wh
         wh = await channel.create_webhook(name=WEBHOOK_NAME)
@@ -451,14 +453,19 @@ class UwuLock(commands.Cog):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
 
-        #--- Check bot permissions ---
-        bot_perms = channel.permissions_for(message.guild.me)
-        if not bot_perms.manage_messages or not bot_perms.manage_webhooks:
-            return
-
-        #--- Is this user uwulocked here? ---
+        #--- Is this user uwulocked here? (cheap DB lookup, run BEFORE perms) ---
         locked = await self._get_locked_users(message.guild.id, channel.id)
         if message.author.id not in locked:
+            return
+
+        #--- Per-user-triggered safety check (only runs when needed) ---
+        # For threads, webhook perms come from the parent channel.
+        if isinstance(channel, discord.Thread):
+            perm_target = channel.parent or channel
+        else:
+            perm_target = channel
+        if not bot_can_webhook_send(perm_target, also_manage_messages=True):
+            #--- No perms to delete+webhook here. Leave the original message. ---
             return
 
         #--- Strip URLs, check if any text remains ---
