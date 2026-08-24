@@ -440,7 +440,10 @@ class UwuLock(commands.Cog):
         #--- Bail on DMs, bots, webhooks, system messages ---
         if message.guild is None or message.author.bot or message.webhook_id is not None:
             return
-        if message.type != discord.MessageType.default:
+        if message.type not in (
+            discord.MessageType.default,
+            discord.MessageType.reply,
+        ):
             return
 
         #--- Only text channels and threads ---

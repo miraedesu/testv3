@@ -380,10 +380,9 @@ class GuildSettings(commands.Cog):
                 (interaction.guild.id, feature),
             ) as cursor:
                 if not await cursor.fetchone():
-                    await interaction.response.send_message(
-                        f"🔒 `{feature}` is an opt-in feature — only the bot owner can enable it "
-                        f"(use `/admin enable_feature`).",
-                        ephemeral=True,
+                    await interaction.response.send_message( 
+                        f"🔒 `{feature}` is locked by the bot owner and cannot be enabled here.", 
+                        ephemeral=True, 
                     )
                     return
         removed = await db_enable_feature(self.bot, interaction.guild.id, feature, channel.id if channel else None)
@@ -444,10 +443,9 @@ class GuildSettings(commands.Cog):
                 (interaction.guild.id, base_cmd),
             ) as cursor:
                 if not await cursor.fetchone():
-                    await interaction.response.send_message(
-                        f"🔒 `/{command}` is an opt-in command — only the bot owner can enable it "
-                        f"(use `/admin enable_command`).",
-                        ephemeral=True,
+                    await interaction.response.send_message( 
+                        f"🔒 `/{command}` is locked by the bot owner and cannot be enabled here.", 
+                        ephemeral=True, 
                     )
                     return
         removed = await db_enable_command(self.bot, interaction.guild.id, command, channel.id if channel else None)
