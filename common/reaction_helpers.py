@@ -56,13 +56,12 @@ async def save_attachment(attachment: discord.Attachment, guild_id: int) -> tupl
 
 
 async def save_from_url(url: str, guild_id: int) -> tuple[str, str] | None:
-    """Downloads an image from a direct URL (including Discord CDN links) to
-    local disk, so the copy doesn't depend on that link staying valid. Returns
-    (path, filename), or None if the download failed or isn't a supported image."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
+                    return None
+                if resp.content_length and resp.content_length > 25 * 1024 * 1024:
                     return None
                 content_type = resp.content_type
                 data = await resp.read()
