@@ -11,10 +11,12 @@ import io
 import logging
 import os
 from collections import defaultdict
+import time
 
 import discord
 from discord.ext import commands, tasks
 from PIL import Image
+import imagehash
 from common.feature_toggles import is_feature_disabled, get_disabled_features
 from common.constants import (
     ALLOWED_ROLE,
@@ -30,7 +32,11 @@ from common.constants import (
 )
 from common.settings_store import get_log_channel
 
+# pHash blocklist matching threshold (max Hamming distance for a "match").
+PHASH_BLOCKLIST_THRESHOLD = 10
 
+# How long the in-memory blocklist cache is valid before re-querying the DB.
+PHASH_BLOCKLIST_CACHE_TTL = 60  # seconds
 
 anti_spam_cache = defaultdict(list)
 spam_handling_in_progress = set()
@@ -56,7 +62,20 @@ def fix_link(match) -> str:
 
     return link + trail
 
-
+def _hamming_distance(hex_a: str, hex_b: str) -> int | None:
+    """Hamming distance between two pHash hex strings.
+    Returns None if either string is malformed."""
+    try:
+        return imagehash.hex_to_hash(hex_a) - imagehash.hex_to_hash(hex_b)
+    except ValueError:
+        return None
+    
+def _compute_phash_from_bytes(image_bytes: bytes) -> str:
+    """Synchronous pHash computation. Call via asyncio.to_thread
+    so the event loop isn't blocked. Returns 16-char hex string."""
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        return str(imagehash.phash(img))
+    
 def generate_snapshot_canvas(attachment_bytes_list: list):
     """CPU-bound Pillow compilation function. Keeps the main async loop lag-free."""
     START_X = 50
@@ -101,6 +120,9 @@ class Moderation(commands.Cog):
         self.bot = bot
         self.cleanup_caches.start()
         self._logged_pins: set[int] = set()
+        # pHash blocklist cache (id, phash, source_url, note) tuples.
+        self._blocklist_cache: list[tuple[int, str, str, str | None]] | None = None
+        self._blocklist_cache_at: float = 0.0
 
     def cog_unload(self):
         self.cleanup_caches.cancel()
@@ -134,7 +156,82 @@ class Moderation(commands.Cog):
     @cleanup_caches.before_loop
     async def before_cleanup_caches(self):
         await self.bot.wait_until_ready()
+    # ---------------- pHash blocklist cache ----------------
 
+    def invalidate_blocklist_cache(self) -> None:
+        """Called by cogs.phash when entries are added/deleted so the next
+        on_message check re-queries the DB instead of serving stale data."""
+        self._blocklist_cache = None
+        self._blocklist_cache_at = 0.0
+
+    async def _get_blocklist(self) -> list[tuple[int, str, str, str | None]]:
+        """Returns the pHash blocklist as (id, phash, source_url, note) tuples.
+        Cached for PHASH_BLOCKLIST_CACHE_TTL seconds."""
+        now_mono = time.monotonic()
+        if (
+            self._blocklist_cache is not None
+            and (now_mono - self._blocklist_cache_at) < PHASH_BLOCKLIST_CACHE_TTL
+        ):
+            return self._blocklist_cache
+
+        try:
+            async with self.bot.db.execute(
+                "SELECT id, phash, source_url, note FROM image_phash"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Failed to load pHash blocklist: {e}")
+            rows = []
+
+        self._blocklist_cache = rows
+        self._blocklist_cache_at = now_mono
+        return rows
+
+    async def _check_phash_blocklist(
+        self, image_attachments: list[discord.Attachment]
+    ) -> tuple[int, str, str, str | None, int, str, discord.Attachment, bytes] | None:
+        """Compute pHash for each image attachment and match against blocklist.
+
+        Returns (stored_id, stored_phash, stored_url, stored_note,
+                 hamming_dist, computed_phash, matched_attachment,
+                 matched_bytes) for the best match within
+        PHASH_BLOCKLIST_THRESHOLD, else None.
+        """
+        blocklist = await self._get_blocklist()
+        if not blocklist:
+            return None
+
+        # (computed_phash, attachment, bytes) — we keep the bytes so the
+        # caller doesn't have to re-download the same attachment to render
+        # the snapshot.
+        computed: list[tuple[str, discord.Attachment, bytes]] = []
+        for att in image_attachments:
+            try:
+                att_bytes = await att.read()
+                p_hash = await asyncio.to_thread(_compute_phash_from_bytes, att_bytes)
+                computed.append((p_hash, att, att_bytes))
+            except Exception as e:
+                logger.error(f"⚠️ pHash computation failed for {att.filename}: {e}")
+
+        if not computed:
+            return None
+
+        best: tuple[int, str, str, str | None, int, str, discord.Attachment, bytes] | None = None
+        for stored_id, stored_phash, stored_url, stored_note in blocklist:
+            for comp_phash, comp_att, comp_bytes in computed:
+                dist = _hamming_distance(comp_phash, stored_phash)
+                if dist is None:
+                    continue
+                if best is None or dist < best[4]:
+                    best = (stored_id, stored_phash, stored_url,
+                            stored_note, dist, comp_phash, comp_att, comp_bytes)
+                    if dist == 0:
+                        return best  # exact match, can't do better
+
+        if best is None or best[4] > PHASH_BLOCKLIST_THRESHOLD:
+            return None
+
+        return best
     # ---------------- guild whitelist ----------------
 
     async def check_guild_whitelist(self, guild: discord.Guild):
@@ -229,7 +326,147 @@ class Moderation(commands.Cog):
         recycle_url = _recycle_url
         log_channel = await get_log_channel(self.bot, message.guild.id, "automod-log")
         disabled_features = await get_disabled_features(self.bot, message.guild.id, message.channel.id)
+        now = discord.utils.utcnow()          # ← ADD
+        user_id = message.author.id 
+        # --- Recently punished auto-delete (top-level, applies to all paths) ---
+        if user_id in recently_punished:
+            if (now - recently_punished[user_id]).total_seconds() < 30:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
+            else:
+                del recently_punished[user_id]
+        # --- pHash blocklist check (image-based scam detection) ---
+        if "automod_image_hash" not in disabled_features:
+            image_atts = [
+                att for att in message.attachments
+                if att.content_type and att.content_type.startswith("image")
+            ]
+            if image_atts:
+                match = await self._check_phash_blocklist(image_atts)
+                if match is not None:
+                    (
+                        stored_id, stored_phash, stored_url, stored_note,
+                        dist, computed_phash, matched_att, matched_bytes,
+                    ) = match
 
+                    recently_punished[user_id] = now
+                    logger.info(
+                        f"🧷 pHash blocklist match: user={message.author} "
+                        f"dist={dist} entry=#{stored_id} phash={computed_phash}"
+                    )
+
+                    if log_channel:
+                        try:
+                            files_to_send: list[discord.File] = []
+                            try:
+                                # Reuse the bytes we already downloaded for
+                                # the pHash computation — no second fetch.
+                                pil_img = await asyncio.to_thread(
+                                    generate_snapshot_canvas, [matched_bytes]
+                                )
+                                img_bin = io.BytesIO()
+                                pil_img.save(img_bin, format="PNG")
+                                img_bin.seek(0)
+                                files_to_send.append(discord.File(
+                                    fp=img_bin, filename="snapshot.png"))
+                            except Exception as e:
+                                logger.error(f"❌ pHash blocklist snapshot failed: {e}")
+
+                            embed = discord.Embed(
+                                color=0xffb6c1,
+                                timestamp=discord.utils.utcnow(),
+                            )
+                            embed.set_author(
+                                name="Deleted Blacklisted Scam Image",
+                                icon_url=recycle_url,
+                            )
+                            embed.add_field(
+                                name="User:", value=message.author.mention, inline=True)
+                            embed.add_field(
+                                name="User ID", value=f"{message.author.id}", inline=True)
+                            embed.add_field(
+                                name="Channel:", value=message.channel.mention, inline=True)
+                            embed.add_field(
+                                name="Action taken:", value="`1 hour timeout`", inline=True)
+                            embed.add_field(
+                                name="Match distance:",
+                                value=f"`{dist}` (threshold ≤ {PHASH_BLOCKLIST_THRESHOLD})",
+                                inline=True,
+                            )
+                            embed.add_field(
+                                name="Matched entry:", value=f"#{stored_id}", inline=True)
+                            if message.content:
+                                embed.add_field(
+                                    name="Message:",
+                                    value=f"`{message.content[:1024]}`", inline=False)
+                            embed.add_field(
+                                name="Account Created",
+                                value=f"<t:{int(message.author.created_at.timestamp())}:D>",
+                                inline=True,
+                            )
+                            embed.add_field(
+                                name="Joined Server",
+                                value=f"<t:{int(message.author.joined_at.timestamp())}:D>" if message.author.joined_at else "Unknown",
+                                inline=True,
+                            )
+                            embed.add_field(
+                                name="Posted pHash:", value=f"`{computed_phash}`", inline=True)
+                            embed.add_field(
+                                name="Matched pHash:", value=f"`{stored_phash}`", inline=True)
+                            if stored_note:
+                                embed.add_field(
+                                    name="Blocklist note:", value=stored_note, inline=False)
+                            embed.add_field(
+                                name="Blocklist source:",
+                                value=f"`{stored_url[:300]}`", inline=False)
+                            if files_to_send:
+                                embed.set_image(url="attachment://snapshot.png")
+
+                            await log_channel.send(embed=embed, files=files_to_send)
+                        except discord.Forbidden:
+                            logger.info(
+                                f"❌ Missing write permissions for automod-log channel: {log_channel.mention}")
+                        except discord.HTTPException as e:
+                            logger.error(
+                                f"❌ Failed to send pHash blocklist log (HTTP {e.status}): {e}")
+                        except Exception as e:
+                            logger.error(
+                                f"❌ Unexpected error sending pHash blocklist log: {e}",
+                                exc_info=True,
+                            )
+                    else:
+                        logger.info(
+                            f"⚠️ [Security Warning] Blacklisted image in '{message.guild.name}' "
+                            f"but automod-log is unconfigured.")
+
+                    # Timeout — failure must NOT block deletion.
+                    try:
+                        await message.author.timeout(
+                            datetime.timedelta(minutes=60),
+                            reason=f"Blacklisted scam image (pHash match dist={dist}, entry #{stored_id})",
+                        )
+                    except discord.Forbidden:
+                        logger.info(
+                            f"❌ Hierarchy blocked: Cannot timeout {message.author}.")
+                    except discord.HTTPException as e:
+                        logger.info(f"❌ Timeout HTTP error for {message.author}: {e}")
+
+                    # Deletion — independent of timeout outcome.
+                    try:
+                        await message.delete()
+                    except discord.NotFound:
+                        pass
+                    except discord.Forbidden:
+                        logger.info(
+                            f"❌ Cannot delete blacklisted-image message in <#{message.channel.id}> "
+                            f"- Missing 'Manage Messages' permission.")
+                    except discord.DiscordException:
+                        pass
+
+                    return
         # Hidden link filter — catches [text](url) markdown for everyone
         if "automod_masked_links" not in disabled_features and masked_link_regex.search(message.content):
             if log_channel:
@@ -327,19 +564,7 @@ class Moderation(commands.Cog):
             if not content and message.attachments:
                 content = f"[file_spam]:{message.attachments[0].filename}_{message.attachments[0].size}"
         if content:
-            now = discord.utils.utcnow()
-            user_id = message.author.id
             channel_id = message.channel.id
-
-            if user_id in recently_punished:
-                if (now - recently_punished[user_id]).total_seconds() < 30:
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
-                    return
-                else:
-                    del recently_punished[user_id]
 
             time_window = datetime.timedelta(seconds=15)
             anti_spam_cache[user_id] = [
@@ -392,11 +617,25 @@ class Moderation(commands.Cog):
                                 else:
                                     other_attachments.append(att)
 
+                        phash_strings: list[str] = []
+                        seen_hashes: set[str] = set()
+
+                        image_hash_enabled = "automod_image_hash" not in disabled_features
+
                         if image_attachments:
                             try:
                                 attachment_bytes_list = []
                                 for att in image_attachments[:4]:
-                                    attachment_bytes_list.append(await att.read())
+                                    att_bytes = await att.read()
+                                    attachment_bytes_list.append(att_bytes)
+                                    if image_hash_enabled:
+                                        try:
+                                            p_hash = await asyncio.to_thread(_compute_phash_from_bytes, att_bytes)
+                                            if p_hash not in seen_hashes:
+                                                seen_hashes.add(p_hash)
+                                                phash_strings.append(p_hash)
+                                        except Exception as e:
+                                            logger.error(f"⚠️ pHash computation failed for {att.filename}: {e}")
 
                                 pil_img = await asyncio.to_thread(generate_snapshot_canvas, attachment_bytes_list)
                                 img_bin = io.BytesIO()
@@ -434,6 +673,16 @@ class Moderation(commands.Cog):
                                 value=f"<t:{int(message.author.joined_at.timestamp())}:D>" if message.author.joined_at else "Unknown",
                                 inline=True,
                             )
+                            # --- pHash field, only if images were hashed ---
+                            if phash_strings:
+                                phash_field = "\n".join(f"`{h}`" for h in phash_strings[:5])
+                                if len(phash_strings) > 5:
+                                    phash_field += f"\n*…and {len(phash_strings) - 5} more*"
+                                embed.add_field(
+                                    name="Image pHash:",
+                                    value=phash_field,
+                                    inline=False,
+                                )
                             if other_attachments:
                                 other_files_text = "\n".join(
                                     [f"`{att.filename}` — {round(att.size / 1024, 1)} KB" for att in other_attachments]
@@ -448,20 +697,40 @@ class Moderation(commands.Cog):
                         except discord.Forbidden:
                             logger.info(
                                 f"❌ Missing write permissions for automod-log channel: {log_channel.mention}")
+                        except discord.HTTPException as e:
+                            logger.error(
+                                f"❌ Failed to send automod-log embed (HTTP {e.status}): {e}")
+                        except Exception as e:
+                            logger.error(
+                                f"❌ Unexpected error sending automod-log: {e}", exc_info=True)
                     else:
                         logger.info(
                             f"⚠️ [Security Warning] Spam in '{message.guild.name}' but automod-log is unconfigured.")
 
+                    # Timeout — failure should NOT block deletion
                     try:
-                        await message.author.timeout(datetime.timedelta(minutes=60), reason="Possible Scam/Spam")
-                        for msg_obj in messages_to_purge:
-                            try:
-                                await msg_obj.delete()
-                            except discord.DiscordException:
-                                pass
+                        await message.author.timeout(
+                            datetime.timedelta(minutes=60),
+                            reason="Possible Scam/Spam",
+                        )
                     except discord.Forbidden:
                         logger.info(
-                            f"❌ Hierarchy blocked: Cannot modify {message.author}.")
+                            f"❌ Hierarchy blocked: Cannot timeout {message.author}.")
+                    except discord.HTTPException as e:
+                        logger.info(f"❌ Timeout HTTP error for {message.author}: {e}")
+
+                    # Deletion — independent of timeout outcome
+                    for msg_obj in messages_to_purge:
+                        try:
+                            await msg_obj.delete()
+                        except discord.NotFound:
+                            pass  # already gone
+                        except discord.Forbidden:
+                            logger.info(
+                                f"❌ Cannot delete message in <#{msg_obj.channel.id}> "
+                                f"- Missing 'Manage Messages' permission.")
+                        except discord.DiscordException:
+                            pass
 
                 finally:
                     anti_spam_cache[user_id].clear()

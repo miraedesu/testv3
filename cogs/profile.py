@@ -19,7 +19,7 @@ DISCORD_CDN_PATTERN = re.compile(
 )
 
 # Strip Discord mention formats from user-controlled text
-MENTION_PATTERN = re.compile(r"<@!?[&]?\d+>")
+MENTION_PATTERN = re.compile(r"<@!?&?\d+>|<#\d+>")
 
 # Maximum notes a single user can have for the same target
 MAX_NOTES_PER_USER = 3
@@ -778,7 +778,7 @@ class Profile(commands.Cog):
         await interaction.response.send_message(embed=embed)
     # ---- /note add ----
 
-    @note.command(name="add", description="Add a note for a member (1 note per user per target).")
+    @note.command(name="add", description="Add a note for a member.")
     @app_commands.describe(member="Member to add a note for")
     @app_commands.guild_only()
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)

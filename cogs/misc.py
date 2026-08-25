@@ -816,10 +816,10 @@ class Misc(commands.Cog):
                 f"❌ An error occurred while fetching the time for {user.mention}.",
                 ephemeral=True
             )
-    @app_commands.command(name="time", description="Generate Discord timestamp syntax (like hammertime.cyou) for any date/time.")
+    @app_commands.command(name="time", description="Generate Discord timestamp for any date/time.")
     @app_commands.describe(
         when="When? (e.g., 'tomorrow 3pm', 'Dec 25 14:30', 'in 2 hours', '2025-12-25 18:00')",
-        timezone="Timezone to interpret the time in (defaults to your saved timezone)",
+        timezone="Timezone to interpret the time in (defaults to your saved timezone via /setmytime)",
     )
     @app_commands.autocomplete(timezone=timezone_autocomplete)
     async def time_cmd(
@@ -875,6 +875,7 @@ class Misc(commands.Cog):
             title="<:alarm:1534195779810365530> Timestamp Generated",
             description=(
                 f"**Parsed as:** <t:{ts}:F> (<t:{ts}:R>)\n"
+                f"**You typed:** `{when}`\n"
                 f"**Timezone:** `{tz_label}`\n\n"
                 f"Copy any format below and paste it into a message\n" 
                 f"Everyone will see it in their own local time."
@@ -1612,22 +1613,22 @@ class Misc(commands.Cog):
         await interaction.followup.send(embed=embed, file=file)
     @app_commands.command(
         name="choose",
-        description="Remember to use \",\" to separate your choices."
+        description="Picks from a list of choices. Example:\"pizza, sushi, burgers\"."
     )
-    @app_commands.describe(choices="Remember to use \",\" to separate your choices, e.g. \"pizza, sushi, burgers\"")
+    @app_commands.describe(choices="Remember to use \",\" to separate your choices")
     async def choose(self, interaction: discord.Interaction, choices: str):
         # Split on comma, strip whitespace, drop empties
         options = [c.strip() for c in choices.split(",") if c.strip()]
         if len(options) < 2:
             await interaction.response.send_message(
                 "Give me at least two choices separated by commas.\n"
-                "Example: `/choose pizza, sushi, burgers`",
+                "Example: `/choose choices:pizza, sushi, burgers`",
                 ephemeral=True,
             )
             return
         pick = random.choice(options)
         await interaction.response.send_message(
-            f"**{interaction.user.display_name}**, \"{pick}\" is the best choice"
+            f"**{interaction.user.display_name}**, **{pick}** is the best choice"
         )
 
     @app_commands.command(
@@ -1660,7 +1661,7 @@ class Misc(commands.Cog):
         low, high = (a, b) if a <= b else (b, a)
         result = random.randint(low, high)
         await interaction.response.send_message(
-            f"**{interaction.user.display_name}**, your number: **{result}**"
+            f"<a:GAMBA:1541375644133232670> **{result}**"
         )
 async def setup(bot: commands.Bot):
     await bot.add_cog(Misc(bot))

@@ -300,6 +300,21 @@ class Database(commands.Cog):
         #     "ON wuwa_pulls (user_id, pulled_at_unix)"
         # )
         # --- Boost List (per-guild sequential entry numbers) ---
+        
+        # --- Image Perceptual Hashes (scam blocklist) ---
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS image_phash (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phash TEXT NOT NULL UNIQUE,
+                source_url TEXT NOT NULL,
+                added_by INTEGER NOT NULL,
+                added_at INTEGER NOT NULL,
+                note TEXT
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_image_phash_phash ON image_phash (phash)"
+        )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS boost_list (
                 guild_id INTEGER NOT NULL,
