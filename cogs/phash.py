@@ -1,15 +1,17 @@
 """Perceptual-hash (pHash) tooling for scam image detection.
 
 Provides owner-only commands to:
-- Compute a pHash for any image URL (Discord CDN attachments, etc.)
-- Save a raw pHash hex string directly (when you only have the hash
-  from an automod-log embed, no source image available)
+- Fetch a pHash from a message's images (by message link or ID)
+- Save a raw pHash hex string directly (e.g. from an automod-log embed)
 - Maintain a persistent blocklist of known-scam image hashes
-- Match a new image's pHash against the blocklist (Hamming distance)
-- Compare two arbitrary image URLs side-by-side
+- List / delete stored pHash entries
 
 The blocklist is the long-lived asset — every scam image you confirm makes
 future detection instant, no OCR or heuristics needed.
+
+Only Discord-CDN images are ever fetched by this cog (attachments are
+Discord-hosted by definition; inline embed URLs are filtered to
+cdn.discordapp.com / media.discordapp.net).
 """
 from __future__ import annotations
 
@@ -25,12 +27,9 @@ from discord.ext import commands
 from PIL import Image, UnidentifiedImageError
 import imagehash
 from cogs.admin import is_bot_owner
+from common.constants import DEV_GUILD_ID
 
 logger = logging.getLogger(__name__)
-
-# <= 10 = visually very similar (variant of the same image / scam template).
-# Tunable per-command via /phash match threshold:N.
-PHASH_DISTANCE_THRESHOLD = 10
 
 # Placeholder source_url for manually-entered hashes (the column is NOT NULL).
 MANUAL_SOURCE_PLACEHOLDER = "(manual entry)"
@@ -47,24 +46,16 @@ MESSAGE_LINK_RE = re.compile(
 )
 
 # Only these URL prefixes are accepted for inline-URL hashing, to prevent
-# SSRF (the bot will never fetch arbitrary internet hosts via this command).
+# SSRF (the bot will never fetch arbitrary internet hosts via this cog).
 _DISCORD_CDN_PREFIXES = (
     "https://cdn.discordapp.com/",
     "https://media.discordapp.net/",
 )
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # ----------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------
-async def _fetch_image_bytes(
-    url: str, session: aiohttp.ClientSession
-) -> bytes:
-    """Download image bytes with a sane timeout, reusing a shared session."""
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        return await resp.read()
-
-
 def _compute_phash(image_bytes: bytes) -> str:
     """Synchronous, CPU-bound pHash computation.
     Returns the 64-bit hash as a 16-char hex string. Call via
@@ -83,16 +74,10 @@ def _validate_phash_hex(s: str) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _hamming_distance(hex_a: str, hex_b: str) -> int | None:
-    """Hamming distance between two pHash hex strings.
-    Returns None if either string is malformed."""
-    try:
-        return imagehash.hex_to_hash(hex_a) - imagehash.hex_to_hash(hex_b)
-    except ValueError:
-        return None
-
+def _hamming_distance(h1: str, h2: str) -> int:
+    """Hamming distance between two 16-char pHash hex strings.
+    Both must be valid hex; no validation here (caller ensures)."""
+    return bin(int(h1, 16) ^ int(h2, 16)).count("1")
 
 # ----------------------------------------------------------------
 # Cog
@@ -121,75 +106,8 @@ class Phash(commands.Cog):
         name="phash",
         description="Perceptual hash tools for scam image detection (owner only)",
         default_permissions=discord.Permissions(administrator=True),
+        guild_ids=[DEV_GUILD_ID],
     )
-
-    # ---------------- get ----------------
-
-    @phash.command(name="get", description="Compute the pHash of an image URL")
-    @app_commands.describe(
-        url="Direct image URL (e.g. a Discord attachment link)",
-        save="Also save this hash to the blocklist (default: false)",
-        note="Optional note (e.g. 'Mr Beast giveaway variant 3')",
-    )
-    @is_bot_owner()
-    async def phash_get(
-        self,
-        interaction: discord.Interaction,
-        url: str,
-        save: bool = False,
-        note: str | None = None,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        session = await self._get_session()
-
-        try:
-            image_bytes = await _fetch_image_bytes(url, session)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            await interaction.followup.send(
-                f"❌ Failed to download image: `{e}`", ephemeral=True
-            )
-            return
-
-        try:
-            phash_str = await asyncio.to_thread(_compute_phash, image_bytes)
-        except (UnidentifiedImageError, OSError) as e:
-            await interaction.followup.send(
-                f"❌ Could not parse image: `{e}`", ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(
-            title="🧷 Image pHash",
-            color=discord.Color.pink(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="URL", value=f"`{url[:300]}`", inline=False)
-        embed.add_field(name="pHash", value=f"`{phash_str}`", inline=False)
-        embed.add_field(
-            name="Size",
-            value=f"{len(image_bytes):,} bytes ({len(image_bytes) / 1024:.1f} KB)",
-            inline=True,
-        )
-        embed.set_thumbnail(url=url)
-
-        if save:
-            saved_id = await self._insert_phash(
-                phash_str, url, interaction.user.id, note
-            )
-            if saved_id is not None:
-                embed.add_field(
-                    name="Saved",
-                    value=f"✅ Stored in blocklist (ID `{saved_id}`) — future matches will find it.",
-                    inline=False,
-                )
-            else:
-                embed.add_field(
-                    name="Save failed",
-                    value=f"❌ pHash `{phash_str}` may already be in the blocklist.",
-                    inline=False,
-                )
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ---------------- fetch (from message ID or link) ----------------
 
@@ -238,7 +156,7 @@ class Phash(commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
 
         # --- Resolve the channel (cache first, then fetch) ---
         channel = self.bot.get_channel(channel_id)
@@ -320,9 +238,8 @@ class Phash(commands.Cog):
         # (b) forwarded messages — discord.py exposes them via message_snapshots
         snapshots = getattr(target_msg, "message_snapshots", None) or []
         for snap in snapshots:
-            snap_msg = snap.message
-            image_atts.extend(att for att in snap_msg.attachments if _is_image(att))
-            _harvest_embeds(snap_msg.embeds)
+            image_atts.extend(att for att in snap.attachments if _is_image(att))
+            _harvest_embeds(snap.embeds)
 
         # Dedupe inline URLs (preserve order)
         inline_urls = list(dict.fromkeys(inline_urls))
@@ -344,9 +261,15 @@ class Phash(commands.Cog):
         results: list[tuple[str, str, str, int, str, int | None, str | None]] = []
         saved_count = 0
 
-        # Attachments
+        # Attachments — skip oversized ones without downloading.
         for att in image_atts:
             label = f"attachment `{att.filename}`"
+            if att.size > MAX_IMAGE_BYTES:
+                results.append((
+                    label, att.url, "", att.size, "attachment", None,
+                    f"too large ({att.size:,} B > {MAX_IMAGE_BYTES:,} B limit)",
+                ))
+                continue
             try:
                 att_bytes = await att.read()
                 p_hash = await asyncio.to_thread(_compute_phash, att_bytes)
@@ -366,11 +289,29 @@ class Phash(commands.Cog):
                     saved_count += 1
             results.append((label, att.url, p_hash, len(att_bytes), "attachment", saved_id, None))
 
-        # Inline URLs (already validated as Discord CDN)
+        # Inline URLs (already validated as Discord CDN).
+        # Check Content-Length before reading the body; if the header is
+        # missing or lies, aiohttp will still cap memory at the actual size.
         for url in inline_urls:
             label = f"embed `{url[:60]}{'…' if len(url) > 60 else ''}`"
             try:
-                image_bytes = await _fetch_image_bytes(url, session)
+                async with session.get(url) as resp:
+                    resp.raise_for_status()
+                    cl = resp.headers.get("Content-Length")
+                    if cl is not None and int(cl) > MAX_IMAGE_BYTES:
+                        results.append((
+                            label, url, "", int(cl), "embed", None,
+                            f"too large ({int(cl):,} B > {MAX_IMAGE_BYTES:,} B limit)",
+                        ))
+                        continue
+                    image_bytes = await resp.read()
+                # Belt-and-suspenders: re-check actual body size.
+                if len(image_bytes) > MAX_IMAGE_BYTES:
+                    results.append((
+                        label, url, "", len(image_bytes), "embed", None,
+                        f"too large ({len(image_bytes):,} B > {MAX_IMAGE_BYTES:,} B limit)",
+                    ))
+                    continue
                 p_hash = await asyncio.to_thread(_compute_phash, image_bytes)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 results.append((label, url, "", 0, "embed", None, f"download: {e}"))
@@ -393,7 +334,7 @@ class Phash(commands.Cog):
 
         # --- Build the response embed ---
         embed = discord.Embed(
-            title="🧷 pHash from message",
+            title="<:search:1534195860123156582> pHash from message",
             color=discord.Color.pink(),
             timestamp=discord.utils.utcnow(),
             url=target_msg.jump_url,
@@ -448,12 +389,6 @@ class Phash(commands.Cog):
                     inline=False,
                 )
 
-        # Thumbnail = first computed image (nice for quick visual confirm)
-        for _label, src_url, p_hash, _size, _kind, _sid, _err in results:
-            if _err is None and p_hash:
-                embed.set_thumbnail(url=src_url)
-                break
-
         embed.set_footer(
             text=(
                 f"Fetched by {interaction.user} · "
@@ -461,69 +396,12 @@ class Phash(commands.Cog):
             )
         )
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    # ---------------- save (from URL) ----------------
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
-    @phash.command(name="save", description="Compute pHash from URL and add to blocklist")
-    @app_commands.describe(
-        url="Direct image URL (e.g. a Discord attachment link)",
-        note="Optional note (e.g. 'Mr Beast giveaway variant 3')",
-    )
-    @is_bot_owner()
-    async def phash_save(
-        self,
-        interaction: discord.Interaction,
-        url: str,
-        note: str | None = None,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        session = await self._get_session()
-
-        try:
-            image_bytes = await _fetch_image_bytes(url, session)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            await interaction.followup.send(
-                f"❌ Failed to download image: `{e}`", ephemeral=True
-            )
-            return
-
-        try:
-            phash_str = await asyncio.to_thread(_compute_phash, image_bytes)
-        except (UnidentifiedImageError, OSError) as e:
-            await interaction.followup.send(
-                f"❌ Could not parse image: `{e}`", ephemeral=True
-            )
-            return
-
-        saved_id = await self._insert_phash(
-            phash_str, url, interaction.user.id, note
-        )
-        if saved_id is None:
-            await interaction.followup.send(
-                f"❌ Save failed (pHash `{phash_str}` may already be in the blocklist)",
-                ephemeral=True,
-            )
-            return
-
-        embed = discord.Embed(
-            title="✅ Saved to blocklist",
-            color=discord.Color.green(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="ID", value=f"`{saved_id}`", inline=True)
-        embed.add_field(name="pHash", value=f"`{phash_str}`", inline=True)
-        embed.add_field(name="URL", value=f"`{url[:300]}`", inline=False)
-        if note:
-            embed.add_field(name="Note", value=note, inline=False)
-        embed.set_thumbnail(url=url)
-        embed.set_footer(text=f"Added by {interaction.user}")
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    # ---------------- save_raw (from hex string) ----------------
+    # ---------------- save (raw hex string) ----------------
 
     @phash.command(
-        name="save_raw",
+        name="save",
         description="Save a raw pHash hex string to the blocklist (no image fetch)",
     )
     @app_commands.describe(
@@ -532,7 +410,7 @@ class Phash(commands.Cog):
         source="Optional source URL or message-jump link for traceability",
     )
     @is_bot_owner()
-    async def phash_save_raw(
+    async def phash_save(
         self,
         interaction: discord.Interaction,
         phash: str,
@@ -565,7 +443,7 @@ class Phash(commands.Cog):
             return
 
         embed = discord.Embed(
-            title="✅ Saved raw pHash to blocklist",
+            title="✅ Saved pHash to blocklist",
             color=discord.Color.green(),
             timestamp=discord.utils.utcnow(),
         )
@@ -579,7 +457,123 @@ class Phash(commands.Cog):
         embed.set_footer(text=f"Added by {interaction.user}")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+    # ---------------- compare ----------------
 
+    @phash.command(
+        name="compare",
+        description="Compare a pHash hex string against all blocklist entries",
+    )
+    @app_commands.describe(
+        phash="The 16-char pHash hex string to compare",
+        threshold="Max Hamming distance to count as a match (default: 10, max: 64)",
+    )
+    @is_bot_owner()
+    async def phash_compare(
+        self,
+        interaction: discord.Interaction,
+        phash: str,
+        threshold: int = 10,
+    ):
+        phash_clean = phash.strip().lower()
+        if not _validate_phash_hex(phash_clean):
+            await interaction.response.send_message(
+                f"❌ `{phash}` is not a valid pHash hex string.\n"
+                "Expected 16 hex characters (e.g. `f0e1d2c3b4a59687`).",
+                ephemeral=True,
+            )
+            return
+
+        if threshold < 0 or threshold > 64:
+            await interaction.response.send_message(
+                "❌ Threshold must be between 0 and 64.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        async with self.bot.db.execute(
+            "SELECT id, phash, source_url, note FROM image_phash"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            await interaction.followup.send(
+                "📭 Blocklist is empty. Nothing to compare against.\n"
+                "Use `/phash save` to add entries first.",
+                ephemeral=True,
+            )
+            return
+
+        # Compute distances and sort ascending.
+        # Each tuple: (distance, id, phash_str, source_url, note)
+        distances: list[tuple[int, int, str, str, str | None]] = []
+        for entry_id, phash_str, source_url, note in rows:
+            dist = _hamming_distance(phash_clean, phash_str)
+            distances.append((dist, entry_id, phash_str, source_url, note))
+        distances.sort(key=lambda x: x[0])
+
+        matches = [d for d in distances if d[0] <= threshold]
+        nearest = distances[:3]  # always shown for context
+
+        embed = discord.Embed(
+            title="<:search:1534195860123156582> pHash comparison",
+            color=discord.Color.pink(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Query",
+            value=(
+                f"`{phash_clean}`\n"
+                f"Threshold: ≤{threshold} bits · DB size: {len(rows)} entries"
+            ),
+            inline=False,
+        )
+
+        if matches:
+            lines: list[str] = []
+            for dist, entry_id, phash_str, source_url, note in matches:
+                note_str = f" — *{note}*" if note else ""
+                url_short = (
+                    source_url if len(source_url) <= 80 else source_url[:77] + "..."
+                )
+                lines.append(
+                    f"**#{entry_id}** `{phash_str}` (Δ{dist}){note_str}\n"
+                    f"  ↳ {url_short}"
+                )
+            embed.add_field(
+                name=f"✅ Matches ({len(matches)})",
+                value="\n".join(lines)[:1024],
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="❌ No matches",
+                value=f"No entries within threshold ≤{threshold} bits.",
+                inline=False,
+            )
+
+        # Always show nearest 3 for context (helps spot near-misses even
+        # when nothing is within threshold — useful when triaging variants).
+        nearest_lines: list[str] = []
+        for dist, entry_id, phash_str, source_url, note in nearest:
+            note_str = f" — *{note}*" if note else ""
+            url_short = (
+                source_url if len(source_url) <= 80 else source_url[:77] + "..."
+            )
+            nearest_lines.append(
+                f"**#{entry_id}** `{phash_str}` (Δ{dist}){note_str}\n"
+                f"  ↳ {url_short}"
+            )
+        embed.add_field(
+            name="Nearest 3 (for context)",
+            value="\n".join(nearest_lines)[:1024],
+            inline=False,
+        )
+
+        embed.set_footer(text=f"Compared by {interaction.user}")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
     # ---------------- list ----------------
 
     @phash.command(name="list", description="List all stored pHashes")
@@ -595,7 +589,7 @@ class Phash(commands.Cog):
 
         if not rows:
             await interaction.followup.send(
-                "📭 Blocklist is empty. Use `/phash save` or `/phash save_raw` to add an entry.",
+                "📭 Blocklist is empty. Use `/phash save` to add an entry.",
                 ephemeral=True,
             )
             return
@@ -613,8 +607,6 @@ class Phash(commands.Cog):
             )
 
         # Chunk to stay under embed description limit (4096 chars).
-        # Fixed: only flush when current is non-empty (avoids empty first chunk
-        # when a single line is itself longer than 4000 chars).
         chunks: list[str] = []
         current = ""
         for line in lines:
@@ -671,147 +663,8 @@ class Phash(commands.Cog):
         embed.add_field(name="URL", value=f"`{source_url[:300]}`", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---------------- match ----------------
-
-    @phash.command(
-        name="match",
-        description="Check if an image URL matches any stored pHash",
-    )
-    @app_commands.describe(
-        url="Image URL to check",
-        threshold="Max Hamming distance to count as match (default: 10)",
-    )
-    @is_bot_owner()
-    async def phash_match(
-        self,
-        interaction: discord.Interaction,
-        url: str,
-        threshold: int = PHASH_DISTANCE_THRESHOLD,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        session = await self._get_session()
-
-        try:
-            image_bytes = await _fetch_image_bytes(url, session)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            await interaction.followup.send(
-                f"❌ Failed to download image: `{e}`", ephemeral=True
-            )
-            return
-
-        try:
-            phash_str = await asyncio.to_thread(_compute_phash, image_bytes)
-        except (UnidentifiedImageError, OSError) as e:
-            await interaction.followup.send(
-                f"❌ Could not parse image: `{e}`", ephemeral=True
-            )
-            return
-
-        await self._render_match_result(
-            interaction, phash_str, threshold, thumbnail_url=url
-        )
-
-    # ---------------- match_raw (from hex string) ----------------
-
-    @phash.command(
-        name="match_raw",
-        description="Check if a raw pHash hex string matches any stored pHash",
-    )
-    @app_commands.describe(
-        phash="The 16-char pHash hex string to look up",
-        threshold="Max Hamming distance to count as match (default: 10)",
-    )
-    @is_bot_owner()
-    async def phash_match_raw(
-        self,
-        interaction: discord.Interaction,
-        phash: str,
-        threshold: int = PHASH_DISTANCE_THRESHOLD,
-    ):
-        phash_clean = phash.strip().lower()
-        if not _validate_phash_hex(phash_clean):
-            await interaction.response.send_message(
-                f"❌ `{phash}` is not a valid pHash hex string.",
-                ephemeral=True,
-            )
-            return
-
-        # Defer only after validation passes (instant response on bad input).
-        await interaction.response.defer(ephemeral=True)
-        await self._render_match_result(
-            interaction, phash_clean, threshold, thumbnail_url=None
-        )
-
-    # ---------------- compare ----------------
-
-    @phash.command(
-        name="compare",
-        description="Compare two image URLs by pHash distance",
-    )
-    @app_commands.describe(url1="First image URL", url2="Second image URL")
-    @is_bot_owner()
-    async def phash_compare(
-        self,
-        interaction: discord.Interaction,
-        url1: str,
-        url2: str,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        session = await self._get_session()
-
-        try:
-            bytes1, bytes2 = await asyncio.gather(
-                _fetch_image_bytes(url1, session),
-                _fetch_image_bytes(url2, session),
-            )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            await interaction.followup.send(
-                f"❌ Failed to download one of the images: `{e}`", ephemeral=True
-            )
-            return
-
-        try:
-            phash1, phash2 = await asyncio.gather(
-                asyncio.to_thread(_compute_phash, bytes1),
-                asyncio.to_thread(_compute_phash, bytes2),
-            )
-        except (UnidentifiedImageError, OSError) as e:
-            await interaction.followup.send(
-                f"❌ Could not parse one of the images: `{e}`", ephemeral=True
-            )
-            return
-
-        await self._render_compare_result(interaction, phash1, phash2)
-
-    # ---------------- compare_raw ----------------
-
-    @phash.command(
-        name="compare_raw",
-        description="Compare two raw pHash hex strings by Hamming distance",
-    )
-    @app_commands.describe(
-        phash1="First 16-char pHash hex string",
-        phash2="Second 16-char pHash hex string",
-    )
-    @is_bot_owner()
-    async def phash_compare_raw(
-        self,
-        interaction: discord.Interaction,
-        phash1: str,
-        phash2: str,
-    ):
-        h1 = phash1.strip().lower()
-        h2 = phash2.strip().lower()
-        if not _validate_phash_hex(h1) or not _validate_phash_hex(h2):
-            await interaction.response.send_message(
-                "❌ One or both pHash strings are not valid 16-char hex.",
-                ephemeral=True,
-            )
-            return
-        await self._render_compare_result(interaction, h1, h2)
-
     # ================================================================
-    # Internal helpers (shared by URL and raw commands)
+    # Internal helpers
     # ================================================================
 
     async def _insert_phash(
@@ -841,121 +694,6 @@ class Phash(commands.Cog):
         except Exception as e:
             logger.warning(f"pHash insert failed for `{phash_str}`: {e}")
             return None
-
-    async def _render_match_result(
-        self,
-        interaction: discord.Interaction,
-        phash_str: str,
-        threshold: int,
-        thumbnail_url: str | None,
-    ) -> None:
-        """Shared match-render logic for /phash match and /phash match_raw."""
-        async with self.bot.db.execute(
-            "SELECT id, phash, source_url, note FROM image_phash"
-        ) as cursor:
-            stored = await cursor.fetchall()
-
-        if not stored:
-            await interaction.followup.send(
-                f"🧷 Your pHash: `{phash_str}`\n"
-                "📭 Blocklist is empty — nothing to match against.",
-                ephemeral=True,
-            )
-            return
-
-        scored: list[tuple[int, int, str, str, str | None]] = []
-        # (distance, id, phash, source_url, note)
-        for entry_id, stored_phash, stored_url, note in stored:
-            dist = _hamming_distance(phash_str, stored_phash)
-            if dist is None:
-                continue
-            scored.append((dist, entry_id, stored_phash, stored_url, note))
-        scored.sort(key=lambda x: x[0])
-
-        # Guard against empty `scored` (all stored hashes malformed).
-        if not scored:
-            await interaction.followup.send(
-                f"🧷 Your pHash: `{phash_str}`\n"
-                "❌ All stored hashes are malformed — blocklist needs repair.",
-                ephemeral=True,
-            )
-            return
-
-        best_dist, best_id, best_phash, best_url, best_note = scored[0]
-        is_match = best_dist <= threshold
-
-        embed = discord.Embed(
-            title="🔍 Match result",
-            color=discord.Color.green() if is_match else discord.Color.light_grey(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="Your pHash", value=f"`{phash_str}`", inline=False)
-        embed.add_field(name="Threshold", value=f"`≤ {threshold}`", inline=True)
-        embed.add_field(
-            name="Best match", value=f"`{best_dist}` (entry #{best_id})", inline=True
-        )
-        embed.add_field(
-            name="Verdict",
-            value=(
-                "✅ **Match** — likely same image or a variant"
-                if is_match
-                else "❎ No match within threshold"
-            ),
-            inline=False,
-        )
-        embed.add_field(name="Matched pHash", value=f"`{best_phash}`", inline=True)
-        embed.add_field(name="Source URL", value=f"`{best_url[:200]}`", inline=False)
-        if best_note:
-            embed.add_field(name="Note", value=best_note, inline=False)
-
-        # Show top-3 closest matches for blocklist curation.
-        top_matches = scored[:3]
-        matches_text = "\n".join(
-            f"• `dist={d}` — #{i} `{h}`" for d, i, h, _, _ in top_matches
-        )
-        embed.add_field(name="Top 3 closest", value=matches_text, inline=False)
-
-        if thumbnail_url:
-            embed.set_thumbnail(url=thumbnail_url)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    async def _render_compare_result(
-        self,
-        interaction: discord.Interaction,
-        phash1: str,
-        phash2: str,
-    ) -> None:
-        """Shared compare-render logic for /phash compare and /phash compare_raw."""
-        dist = _hamming_distance(phash1, phash2)
-        if dist is None:
-            await interaction.followup.send(
-                "❌ Could not compare hashes (one is malformed).", ephemeral=True
-            )
-            return
-
-        if dist == 0:
-            verdict = "🟢 Identical (same image)"
-        elif dist <= 5:
-            verdict = "🟢 Near-identical (minor edits: re-encode, resize, crop)"
-        elif dist <= 10:
-            verdict = "🟡 Visually very similar (likely a variant)"
-        elif dist <= 20:
-            verdict = "🟠 Related (same template / same subject, different content)"
-        else:
-            verdict = "🔴 Different images"
-
-        embed = discord.Embed(
-            title="🧷 pHash comparison",
-            color=discord.Color.pink(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="pHash 1", value=f"`{phash1}`", inline=False)
-        embed.add_field(name="pHash 2", value=f"`{phash2}`", inline=False)
-        embed.add_field(name="Hamming distance", value=f"`{dist}`", inline=True)
-        embed.add_field(name="Verdict", value=verdict, inline=False)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

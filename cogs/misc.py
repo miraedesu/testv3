@@ -139,7 +139,18 @@ def get_dateparser_tz_string(tz_str: str) -> str:
             return f"UTC{sign}{hours}:{minutes:02d}"
         return f"UTC{sign}{hours}"
     return tz_str
-
+def _format_gmt_offset(td: timedelta | None) -> str:
+    """Format a UTC offset timedelta as 'GMT+5', 'GMT-8:30', etc.
+    Returns 'GMT+0' for None (e.g. UTC)."""
+    if td is None:
+        return "GMT+0"
+    total_minutes = int(td.total_seconds() / 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    if minutes:
+        return f"GMT{sign}{hours}:{minutes:02d}"
+    return f"GMT{sign}{hours}"
 # ============================================================
 #  PAGINATION VIEW
 # ============================================================
@@ -682,7 +693,62 @@ class Misc(commands.Cog):
                     break
 
         return results[:25]
+    def _resolve_timezone(self, raw: str) -> str | None:
+        """Auto-resolve a user-typed timezone string to a normalized tz.
+        Searches country map, IANA database, and GMT/UTC offsets.
+        Returns None if no confident single match found."""
+        if not raw:
+            return None
+        s = raw.strip()
+        if not s:
+            return None
+        sl = s.lower()
 
+        # 1. Normalize manual UTC/GMT offsets ("UTC+5", "GMT-8:30", "Etc/GMT+3")
+        m = re.match(
+            r'^(?:Etc/GMT|UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$',
+            s, re.IGNORECASE,
+        )
+        if m:
+            sign, hours, minutes = m.groups()
+            hours = int(hours)
+            minutes = int(minutes) if minutes else 0
+            if s.upper().startswith("ETC/GMT"):
+                sign = '-' if sign == '+' else '+'
+            return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+        all_tz = zoneinfo.available_timezones()
+
+        # 2. Direct IANA match (case-sensitive first, then case-insensitive)
+        if s in all_tz:
+            return s
+        for tz in all_tz:
+            if tz.lower() == sl:
+                return tz
+
+        # 3. Exact country-name match (case-insensitive)
+        for name, tz in self.COUNTRY_TIMEZONE_MAP.items():
+            if name.lower() == sl:
+                return tz
+
+        # 4. Partial country-name match (input contains name OR name contains input)
+        #     Only commit if exactly one candidate — otherwise ambiguous.
+        country_hits = [
+            tz for name, tz in self.COUNTRY_TIMEZONE_MAP.items()
+            if sl in name.lower() or name.lower() in sl
+        ]
+        if len(country_hits) == 1:
+            return country_hits[0]
+
+        # 5. Partial IANA match — only commit if exactly one candidate
+        iana_hits = [
+            tz for tz in all_tz
+            if not tz.startswith("Etc/GMT") and sl in tz.lower()
+        ]
+        if len(iana_hits) == 1:
+            return iana_hits[0]
+
+        return None
     @app_commands.command(name="setmytime", description="Set your timezone for reminder parsing. Use 'none' to remove.")
     @app_commands.describe(timezone="Your timezone (start typing your country/city to see options)")
     @app_commands.autocomplete(timezone=timezone_autocomplete)
@@ -743,9 +809,9 @@ class Misc(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="timenow", description="Check the current time for a user based on their set timezone.")
+    @app_commands.command(name="timenow_for", description="Check the current time for a user based on their set timezone.")
     @app_commands.describe(user="Whos time you wanna check")
-    async def timenow(self, interaction: discord.Interaction, user: discord.User):
+    async def timenow_for(self, interaction: discord.Interaction, user: discord.User):
         target_tz = await get_user_timezone(self.bot.db, user.id)
         
         if not target_tz:
@@ -816,12 +882,82 @@ class Misc(commands.Cog):
                 f"❌ An error occurred while fetching the time for {user.mention}.",
                 ephemeral=True
             )
+    @app_commands.command(name="timenow", description="Check the current time in any timezone.")
+    @app_commands.describe(
+        timezone="Timezone to check (e.g. 'Tokyo', 'America/New_York', 'UTC+5', 'London')"
+    )
+    async def timenow(self, interaction: discord.Interaction, timezone: str):
+        resolved = self._resolve_timezone(timezone)
+        if resolved is None:
+            await interaction.response.send_message(
+                f"❌ Couldn't find a timezone matching `{timezone}`.\n"
+                "Try formats like `America/New_York`, `Tokyo`, `London`, `UTC+5`, or `GMT-8`.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            try:
+                tz_info = zoneinfo.ZoneInfo(resolved)
+            except Exception:
+                from dateutil import tz as dateutil_tz
+                tz_info = dateutil_tz.gettz(resolved)
+                if not tz_info:
+                    raise ValueError("Invalid timezone")
+
+            now_in_tz = datetime.now(tz_info)
+            formatted = now_in_tz.strftime("%I:%M %p %Z (%B %d, %Y)")
+
+            # Author's offset difference for context (optional, never fatal)
+            diff_str = ""
+            author_tz = await get_user_timezone(self.bot.db, interaction.user.id)
+            if author_tz:
+                try:
+                    try:
+                        author_tz_info = zoneinfo.ZoneInfo(author_tz)
+                    except Exception:
+                        from dateutil import tz as dateutil_tz
+                        author_tz_info = dateutil_tz.gettz(author_tz)
+                    target_offset = now_in_tz.utcoffset()
+                    author_offset = datetime.now(author_tz_info).utcoffset()
+                    if target_offset is not None and author_offset is not None:
+                        diff = target_offset - author_offset
+                        diff_hours = diff.total_seconds() / 3600
+                        if diff_hours > 0:
+                            diff_str = f"\n\nIt is **{diff_hours:g} hours ahead** of you."
+                        elif diff_hours < 0:
+                            diff_str = f"\n\nIt is **{abs(diff_hours):g} hours behind** you."
+                        else:
+                            diff_str = "\n\nIt's in the **same timezone** as you."
+                except Exception:
+                    pass
+
+            # Friendly display label: use country name if we resolved via the map
+            label = resolved
+            for name, tz in self.COUNTRY_TIMEZONE_MAP.items():
+                if tz == resolved:
+                    label = f"{name} ({resolved})"
+                    break
+            gmt_str = _format_gmt_offset(now_in_tz.utcoffset())
+            embed = discord.Embed(
+                title=f"<:alarm:1534195779810365530> Time in {label}",
+                description=f"**{formatted}**{diff_str}",
+                color=discord.Color.pink(),
+            )
+            embed.add_field(name="UTC offset", value=f"`{gmt_str}`", inline=True)
+            # Non-ephemeral — visible to everyone in the channel.
+            await interaction.response.send_message(embed=embed)
+        except Exception as e:
+            logger.error(f"[Misc] Error in timenow: {e}")
+            await interaction.response.send_message(
+                f"❌ An error occurred while fetching the time for `{timezone}`.",
+                ephemeral=True,
+            )    
     @app_commands.command(name="time", description="Generate Discord timestamp for any date/time.")
     @app_commands.describe(
         when="When? (e.g., 'tomorrow 3pm', 'Dec 25 14:30', 'in 2 hours', '2025-12-25 18:00')",
-        timezone="Timezone to interpret the time in (defaults to your saved timezone via /setmytime)",
+        timezone="Timezone to interpret the time in (e.g. 'Tokyo', 'America/New_York', 'UTC+5') — defaults to your saved timezone",
     )
-    @app_commands.autocomplete(timezone=timezone_autocomplete)
     async def time_cmd(
         self,
         interaction: discord.Interaction,
@@ -833,21 +969,16 @@ class Misc(commands.Cog):
         if timezone is None:
             user_tz = await get_user_timezone(self.bot.db, interaction.user.id)
         else:
-            # Normalize manual UTC/GMT offsets (same logic as /setmytime)
-            match = re.match(
-                r'^(?:Etc/GMT|UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$',
-                timezone, re.IGNORECASE,
-            )
-            if match:
-                sign, hours, minutes = match.groups()
-                hours = int(hours)
-                minutes = int(minutes) if minutes else 0
-                if timezone.upper().startswith("ETC/GMT"):
-                    sign = '-' if sign == '+' else '+'
-                user_tz = f"UTC{sign}{hours:02d}:{minutes:02d}"
-            else:
-                user_tz = timezone.split(" ")[0] if " " in timezone else timezone
+            user_tz = self._resolve_timezone(timezone)
+            if user_tz is None:
+                await interaction.response.send_message(
+                    f"❌ Couldn't find a timezone matching `{timezone}`.\n"
+                    "Try formats like `America/New_York`, `Tokyo`, `London`, `UTC+5`, or `GMT-8`.",
+                    ephemeral=True,
+                )
+                return
 
+        # ----- everything below this line is identical to the old code -----
         # Parse the date/time with dateparser, applying the resolved timezone
         parse_settings = DEFAULT_DATEPARSER_SETTINGS.copy()
         if user_tz:
@@ -869,27 +1000,41 @@ class Misc(commands.Cog):
 
         ts = int(parsed_dt.timestamp())
 
-        # Build embed with all chat-syntax variants for the user to copy
+        gmt_str = "GMT+0"
+        if user_tz:
+            try:
+                try:
+                    tz_info_for_offset = zoneinfo.ZoneInfo(user_tz)
+                except Exception:
+                    from dateutil import tz as dateutil_tz
+                    tz_info_for_offset = dateutil_tz.gettz(user_tz)
+                if tz_info_for_offset is not None:
+                    local_dt = parsed_dt.astimezone(tz_info_for_offset)
+                    gmt_str = _format_gmt_offset(local_dt.utcoffset())
+            except Exception:
+                pass
+
         tz_label = user_tz if user_tz else "UTC (default)"
         embed = discord.Embed(
             title="<:alarm:1534195779810365530> Timestamp Generated",
             description=(
                 f"**Parsed as:** <t:{ts}:F> (<t:{ts}:R>)\n"
                 f"**You typed:** `{when}`\n"
-                f"**Timezone:** `{tz_label}`\n\n"
-                f"Copy any format below and paste it into a message\n" 
+                f"**Timezone:** `{tz_label}`\n"
+                f"**UTC offset:** `{gmt_str}`\n\n"
+                f"Copy any format below and paste it into a message\n"
                 f"Everyone will see it in their own local time."
             ),
             color=discord.Color.pink(),
             timestamp=discord.utils.utcnow(),
         )
 
+
         for name, fmt in TIMESTAMP_FORMATS:
             if fmt:
                 syntax = f"`<t:{ts}:{fmt}>`"
                 preview = f"<t:{ts}:{fmt}>"
             else:
-                # Raw Unix timestamp
                 syntax = f"`{ts}`"
                 preview = f"`{ts}` (raw unix — paste without backticks)"
             embed.add_field(name=name, value=f"{syntax}  →  {preview}", inline=False)
@@ -1526,8 +1671,21 @@ class Misc(commands.Cog):
         await interaction.response.defer()
 
         # Resolve aliases (YEN → JPY, etc.) then validate
-        src = CURRENCY_ALIASES.get(from_currency.upper().strip(), from_currency.upper().strip())
-        tgt = CURRENCY_ALIASES.get(to_currency.upper().strip(), to_currency.upper().strip())
+        raw_src = from_currency.upper().strip()
+        for part in re.split(r' [—→] ', raw_src):
+            part = part.strip()
+            if len(part) == 3 and part.isalpha():
+                raw_src = part
+                break
+        src = CURRENCY_ALIASES.get(raw_src, raw_src)
+
+        raw_tgt = to_currency.upper().strip()
+        for part in re.split(r' [—→] ', raw_tgt):
+            part = part.strip()
+            if len(part) == 3 and part.isalpha():
+                raw_tgt = part
+                break
+        tgt = CURRENCY_ALIASES.get(raw_tgt, raw_tgt)
 
         if len(src) != 3 or not src.isalpha():
             await interaction.followup.send(
@@ -1567,11 +1725,28 @@ class Misc(commands.Cog):
                     if resp.status != 200:
                         body = await resp.text()
                         logger.error(f"[Misc] Wise API error {resp.status}: {body[:300]}")
-                        await interaction.followup.send(
-                            f"❌ Couldn't fetch exchange rate for {src}→{tgt}. "
-                            f"Make sure both are valid ISO-4217 currency codes (e.g. USD, EUR, JPY).",
-                            ephemeral=True,
-                        )
+                        # Try to extract Wise's own error message (e.g. 422
+                        # "Sorry, you can't send between these currencies right now.")
+                        friendly = None
+                        try:
+                            err_json = json.loads(body)
+                            errors = err_json.get("errors", [])
+                            if errors and isinstance(errors, list):
+                                friendly = errors[0].get("message")
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+                        if friendly:
+                            await interaction.followup.send(
+                                f"❌ {friendly}\n"
+                                f"({src} → {tgt})",
+                                ephemeral=True,
+                            )
+                        else:
+                            await interaction.followup.send(
+                                f"❌ Couldn't fetch exchange rate for {src}→{tgt}. "
+                                f"Make sure both are valid ISO-4217 currency codes (e.g. USD, EUR, JPY).",
+                                ephemeral=True,
+                            )
                         return
 
                     data = await resp.json()
