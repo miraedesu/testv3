@@ -13,8 +13,12 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
-
-from common.safeguard import bot_can_webhook_send
+from common.safeguard import (
+    check_webhook_message,
+    get_managed_webhook,
+    watermark_content,
+    bot_can_webhook_send,
+)
 from common.reaction_helpers import pick_random_phrase
 from common.settings_store import (
     clear_guild_setting,
@@ -272,43 +276,6 @@ def _uwuify_sentences(text: str) -> str:
     return "  ".join(result_sentences)
 
 
-#--- Webhook helper ---
-
-_webhook_cache: dict[int, discord.Webhook] = {}
-
-
-async def _get_webhook(
-    channel: discord.TextChannel | discord.ForumChannel,
-) -> Optional[discord.Webhook]:
-    """Find or create the UwuLock webhook for a channel. Caches by channel ID."""
-    #--- Check cache first ---
-    cached = _webhook_cache.get(channel.id)
-    if cached is not None:
-        try:
-            await cached.fetch()  #--- Verify it still exists ---
-            return cached
-        except (discord.NotFound, discord.Forbidden):
-            _webhook_cache.pop(channel.id, None)
-
-    #--- Lookup or create ---
-    try:
-        webhooks = await channel.webhooks()
-        for wh in webhooks:
-            #--- Only trust webhooks created by the bot itself ---
-            if wh.name == WEBHOOK_NAME and wh.user is not None and wh.user.id == channel.guild.me.id:
-                _webhook_cache[channel.id] = wh
-                return wh
-        wh = await channel.create_webhook(name=WEBHOOK_NAME)
-        _webhook_cache[channel.id] = wh
-        return wh
-    except discord.Forbidden:
-        logger.warning("[UwuLock] Missing Manage Webhooks permission in #%s", channel)
-        return None
-    except Exception:
-        logger.exception("[UwuLock] Failed to get/create webhook in #%s", channel)
-        return None
-
-
 #--- Cog: UwuLock ---
 
 class UwuLock(commands.Cog):
@@ -439,13 +406,15 @@ class UwuLock(commands.Cog):
         if _CIRCUIT_TRIPPED:
             return
 
-        #--- Bail on DMs, bots, webhooks, system messages ---
-        if message.guild is None or message.author.bot or message.webhook_id is not None:
+        #--- Webhook security: intercept all webhook messages ---
+        if message.webhook_id is not None:
+            await check_webhook_message(message, self.bot)
             return
-        if message.type not in (
-            discord.MessageType.default,
-            discord.MessageType.reply,
-        ):
+
+        #--- Bail on DMs, bots, system messages ---
+        if message.guild is None or message.author.bot:
+            return
+        if message.type != discord.MessageType.default:
             return
 
         #--- Only text channels and threads ---
@@ -494,7 +463,7 @@ class UwuLock(commands.Cog):
         if webhook_channel is None:
             return  #--- Parent channel deleted — can't create webhook ---
 
-        webhook = await _get_webhook(webhook_channel)
+        webhook = await get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
         if webhook is None:
             return  #--- No webhook available — don't delete, original preserved ---
 
@@ -511,7 +480,7 @@ class UwuLock(commands.Cog):
         #--- Send uwuified text via webhook ---
         try:
             await webhook.send(
-                content=uwu_text,
+                content=watermark_content(uwu_text),
                 username=message.author.display_name,
                 avatar_url=message.author.display_avatar.url,
                 allowed_mentions=discord.AllowedMentions(

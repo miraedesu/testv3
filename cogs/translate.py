@@ -17,7 +17,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from common.safeguard import bot_can_webhook_send
+from common.safeguard import (
+    bot_can_webhook_send,
+    check_webhook_message,
+    get_managed_webhook,
+    watermark_content,
+)
 from common.settings_store import (
     clear_guild_setting,
     get_guild_setting,
@@ -33,7 +38,6 @@ MAX_MESSAGE_LENGTH = 1000   # chars — skip translation if message exceeds this
 WEBHOOK_NAME = "Translator"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-
 
 #--- OpenRouter API helpers ---
 
@@ -230,58 +234,23 @@ async def _detect_language(text: str) -> Optional[str]:
         logger.exception("[Translate] OpenRouter detection call failed")
         return None
 
-#--- Webhook helper (same pattern as uwu.py) ---
-
-_webhook_cache: dict[int, discord.Webhook] = {}
-
-
-async def _get_webhook(
-    channel: discord.TextChannel | discord.ForumChannel,
-) -> Optional[discord.Webhook]:
-    """Find or create the Translator webhook for a channel. Caches by channel ID."""
-    #--- Check cache first ---
-    cached = _webhook_cache.get(channel.id)
-    if cached is not None:
-        try:
-            await cached.fetch()  #--- Verify it still exists ---
-            return cached
-        except (discord.NotFound, discord.Forbidden):
-            _webhook_cache.pop(channel.id, None)
-
-    #--- Lookup or create ---
-    try:
-        webhooks = await channel.webhooks()
-        for wh in webhooks:
-            #--- Only trust webhooks created by the bot itself ---
-            if wh.name == WEBHOOK_NAME and wh.user is not None and wh.user.id == channel.guild.me.id:
-                _webhook_cache[channel.id] = wh
-                return wh
-        wh = await channel.create_webhook(name=WEBHOOK_NAME)
-        _webhook_cache[channel.id] = wh
-        return wh
-    except discord.Forbidden:
-        logger.warning("[Translate] Missing Manage Webhooks permission in #%s", channel)
-        return None
-    except Exception:
-        logger.exception("[Translate] Failed to get/create webhook in #%s", channel)
-        return None
-
-
 #--- Cog: Translate ---
 
 class Translate(commands.Cog):
     """Auto-translate a user's messages in a channel via OpenRouter and
     repost the translation via webhook. Original message stays intact.
     """
-
     translate = app_commands.Group(
         name="translate",
         description="Toggle auto-translation for specific users in this channel",
         default_permissions=discord.Permissions(administrator=True),
     )
-
     def __init__(self, bot):
         self.bot = bot
+        
+    async def cog_load(self):
+        from common.safeguard import init_safeguard
+        await init_safeguard(self.bot)
 
     #--- Storage helpers ---
     # Format: JSON dict { "user_id": "source_language", ... }
@@ -314,30 +283,22 @@ class Translate(commands.Cog):
 
     #--- /translate default ---
 
-    @translate.command(name="default", description="Set the default target language and source display for this channel")
+    @translate.command(name="default", description="Set the default target language for this channel")
     @app_commands.describe(
         language="Default language (e.g. English, Japanese, Spanish)",
-        show_source="Show detected source language in webhook name (e.g. 'Name [from: Japanese]')",
     )
     async def translate_default(
         self,
         interaction: discord.Interaction,
         language: str,
-        show_source: bool = False,
     ):
-        """Set the default translation language + source display for this channel."""
+        """Set the default translation language for this channel."""
         await set_guild_setting(
             self.bot, interaction.guild_id,
             f"translate_default:{interaction.channel_id}", language
         )
-        await set_guild_setting(
-            self.bot, interaction.guild_id,
-            f"translate_show_source:{interaction.channel_id}",
-            "1" if show_source else "0",
-        )
-        source_note = " (showing source language)" if show_source else ""
         await interaction.response.send_message(
-            f"Default translation language for this channel set to **{language}**{source_note}.",
+            f"Default translation language for this channel set to **{language}**.",
             ephemeral=True,
         )
     #--- /translate user ---
@@ -471,29 +432,20 @@ class Translate(commands.Cog):
 
     #--- /detect (standalone command, not part of the translate group) ---
 
-    @app_commands.command(name="detect", description="Detect the language of a user's message or a specific message")
+    @app_commands.command(name="detect", description="Detect the language of a specific message")
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
-        user="User whose latest message to detect",
-        message_id="ID of a specific message to detect",
+        message_id="ID of the message to analyze (right-click → Copy ID)",
     )
     async def detect(
         self,
         interaction: discord.Interaction,
-        user: Optional[discord.Member] = None,
-        message_id: Optional[str] = None,
+        message_id: str,
     ):
         """Detect the language of a message using OpenRouter (GLM 5.3 Flash).
 
-        Provide either a user (searches their last message in this channel)
-        or a message ID (fetches that specific message).
+        Fetches the specified message by ID and detects its language.
         """
-        if not user and not message_id:
-            await interaction.response.send_message(
-                "Provide either a user or a message ID.", ephemeral=True
-            )
-            return
-
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.response.send_message(
                 "Detect only works in text channels and threads.", ephemeral=True
@@ -503,41 +455,23 @@ class Translate(commands.Cog):
         #--- Defer — API call may take a second or two ---
         await interaction.response.defer(ephemeral=True)
 
-        #--- Find the message to analyze ---
-        target_text: Optional[str] = None
-        author_display: Optional[str] = None
+        #--- Fetch the message by ID ---
+        try:
+            msg = await interaction.channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden):
+            await interaction.followup.send(
+                "Could not find that message in this channel.", ephemeral=True
+            )
+            return
+        except ValueError:
+            await interaction.followup.send(
+                "Invalid message ID. Right-click a message → Copy ID.",
+                ephemeral=True,
+            )
+            return
 
-        if message_id:
-            #--- Fetch specific message by ID ---
-            try:
-                msg = await interaction.channel.fetch_message(int(message_id))
-                target_text = msg.content
-                author_display = msg.author.display_name
-            except (discord.NotFound, discord.Forbidden):
-                await interaction.followup.send(
-                    "Could not find that message.", ephemeral=True
-                )
-                return
-            except ValueError:
-                await interaction.followup.send(
-                    "Invalid message ID.", ephemeral=True
-                )
-                return
-        else:
-            #--- Search channel history for the user's latest text message ---
-            async for msg in interaction.channel.history(limit=50):
-                if msg.author.id == user.id and msg.content.strip():
-                    target_text = msg.content
-                    author_display = user.display_name
-                    break
-
-            if target_text is None:
-                await interaction.followup.send(
-                    f"Couldn't find a recent text message from "
-                    f"{user.display_name} in this channel.",
-                    ephemeral=True,
-                )
-                return
+        target_text = msg.content
+        author_display = msg.author.display_name
 
         #--- Validate text content ---
         if not target_text or not target_text.strip():
@@ -573,7 +507,6 @@ class Translate(commands.Cog):
         )
         embed.add_field(name="Message", value=f"```\n{snippet}\n```", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
-
     #--- on_message: translate + repost via webhook ---
 
     @commands.Cog.listener()
@@ -584,8 +517,13 @@ class Translate(commands.Cog):
         The original message is NOT deleted — the translation appears
         alongside it as a webhook message with the user's name and avatar.
         """
-        #--- Bail on DMs, bots, webhooks, system messages ---
-        if message.guild is None or message.author.bot or message.webhook_id is not None:
+        #--- Webhook security: intercept all webhook messages ---
+        if message.webhook_id is not None:
+            await check_webhook_message(message, self.bot)
+            return
+
+        #--- Bail on DMs, bots, system messages ---
+        if message.guild is None or message.author.bot:
             return
         if message.type not in (
             discord.MessageType.default,
@@ -643,7 +581,7 @@ class Translate(commands.Cog):
         if webhook_channel is None:
             return  #--- Parent channel deleted ---
 
-        webhook = await _get_webhook(webhook_channel)
+        webhook = await get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
         if webhook is None:
             return  #--- No webhook available — skip silently ---
 
@@ -655,48 +593,30 @@ class Translate(commands.Cog):
 
         #--- source_language is what's stored per-user (the FROM language) ---
         source_language = translated[message.author.id]
-        source_is_auto = not source_language or source_language.lower() == "auto"
-
-        #--- Check if source language display is enabled for this channel ---
-        show_source_raw = await get_guild_setting(
-            self.bot, message.guild.id,
-            f"translate_show_source:{channel.id}"
-        )
-        show_source = show_source_raw == "1"
-
-        #--- Determine if we need source detection from the API ---
-        #--- Only needed when source is auto AND show_source is on ---
-        #--- (when source is filtered, we already know the language) ---
-        need_detect = source_is_auto and show_source
 
         #--- Call OpenRouter for translation ---
-        translated_text, detected_source = await _translate_text(
+        translated_text, _ = await _translate_text(
             text,
             target_language,
             source_language=source_language,
-            detect_source=need_detect,
+            detect_source=False,
         )
         if translated_text is None or not translated_text.strip():
-            return  #--- Translation failed, empty, or not in source language — skip ---
+            return  #--- Translation failed, empty, or not in source language ---
 
         #--- Don't repost if translation is identical to original ---
         if translated_text.strip().lower() == text.strip().lower():
             return
-        #--- Build reply content ---
-        #--- Include jump link to original message for context ---
+
+        #--- Build content: translated text + link to original ---
         msg_link = (
             f"https://discord.com/channels/"
             f"{message.guild.id}/{channel.id}/{message.id}"
         )
+        content = f"{translated_text[:1900]}\n\n[Original]({msg_link})"
 
-        if show_source:
-            display_source = detected_source or (source_language if not source_is_auto else None)
-            if display_source:
-                content = f"**{display_source} → {target_language}**\n{translated_text[:1800]}\n\n[Original]({msg_link})"
-            else:
-                content = f"**→ {target_language}**\n{translated_text[:1800]}\n\n[Original]({msg_link})"
-        else:
-            content = f"{translated_text[:1900]}\n\n[Original]({msg_link})"
+        #--- Apply invisible security watermark ---
+        content = watermark_content(content)
 
         #--- Send translated text via webhook ---
         try:
@@ -717,36 +637,6 @@ class Translate(commands.Cog):
                 "(message id %s, channel %s, author %s).",
                 message.id, channel, message.author,
             )
-        # #--- Build webhook username ---
-        # if show_source:
-        #     #--- Use detected source (auto) or known source (filtered) ---
-        #     display_source = detected_source or (source_language if not source_is_auto else None)
-        #     if display_source:
-        #         webhook_username = f"{message.author.display_name} [{display_source}]"
-        #     else:
-        #         webhook_username = message.author.display_name
-        # else:
-        #     webhook_username = message.author.display_name
-
-        # #--- Send translated text via webhook ---
-        # try:
-        #     await webhook.send(
-        #         content=translated_text[:2000],  #--- Discord 2000-char safety ---
-        #         username=webhook_username,
-        #         avatar_url=message.author.display_avatar.url,
-        #         allowed_mentions=discord.AllowedMentions(
-        #             everyone=False,
-        #             roles=False,
-        #             users=True,
-        #         ),
-        #         **thread_kwarg,
-        #     )
-        # except Exception:
-        #     logger.exception(
-        #         "[Translate] Webhook send failed "
-        #         "(message id %s, channel %s, author %s).",
-        #         message.id, channel, message.author,
-        #     )
 
 #--- Cog entry point ---
 

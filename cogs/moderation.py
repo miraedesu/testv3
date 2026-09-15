@@ -266,6 +266,8 @@ class Moderation(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        if message.webhook_id is not None:
+            return
         if message.author.bot or message.author == self.bot.user:
             return
 
