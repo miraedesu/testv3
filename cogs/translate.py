@@ -16,7 +16,7 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
-
+import base64
 from common.safeguard import (
     bot_can_webhook_send,
     check_webhook_message,
@@ -38,6 +38,9 @@ MAX_MESSAGE_LENGTH = 1000   # chars — skip translation if message exceeds this
 WEBHOOK_NAME = "Translator"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+# Discord CDN domains — only these are accepted for image_url
+_DISCORD_CDN_DOMAINS = ("cdn.discordapp.com", "media.discordapp.net")
 
 #--- OpenRouter API helpers ---
 
@@ -72,9 +75,7 @@ async def _translate_text(
     #--- Build prompt based on whether we're filtering by source language ---
 
     if source_is_filtered:
-        #--- Only translate if text is in the specified source language ---
         if detect_source:
-            #--- Source is known, no need to detect — just translate ---
             detect_source = False
 
         system_prompt = (
@@ -89,7 +90,6 @@ async def _translate_text(
             f"Preserve any @mentions, custom emotes (<:name:id>), and emojis exactly as they are."
         )
     elif detect_source:
-        #--- Auto source + we want to know the source language ---
         system_prompt = (
             f"Translate the following text to {target_language}. "
             "The text may contain slang, informal language, internet speak, "
@@ -100,7 +100,6 @@ async def _translate_text(
             "No other text. Preserve @mentions, custom emotes (<:name:id>), and emojis exactly as they are."
         )
     else:
-        #--- Auto source, no detection needed ---
         system_prompt = (
             f"Translate the following text to {target_language}. "
             "The text may contain slang, informal language, internet speak, "
@@ -147,14 +146,12 @@ async def _translate_text(
                     logger.warning("[Translate] OpenRouter returned null content.")
                     return None, None
 
-                #--- Source filtering: check for SKIP ---
                 if source_is_filtered:
                     stripped = content.strip()
                     if stripped.upper() == "SKIP":
-                        return None, None  #--- Text wasn't in source language ---
+                        return None, None
                     return stripped, source_language
 
-                #--- Auto + detect_source: parse JSON ---
                 if detect_source:
                     try:
                         parsed = json.loads(content)
@@ -166,7 +163,6 @@ async def _translate_text(
                         logger.warning("[Translate] JSON parse failed, using raw content.")
                         return content.strip(), None
 
-                #--- Auto, no detection: plain translation ---
                 return content.strip(), None
     except asyncio.TimeoutError:
         logger.warning("[Translate] OpenRouter timed out after 30s (text: %s)", text[:100])
@@ -234,27 +230,151 @@ async def _detect_language(text: str) -> Optional[str]:
         logger.exception("[Translate] OpenRouter detection call failed")
         return None
 
+async def _translate_image(
+    image_bytes: bytes | None,
+    content_type: str | None,
+    image_url: str | None,
+    target_language: str,
+    accompanying_text: str | None = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Send an image to GLM-5.3-flash for OCR + translation.
+
+    Either `image_bytes` (uploaded attachment, sent as base64) or
+    `image_url` (Discord CDN link, URL passed directly to OpenRouter)
+    must be provided. If `accompanying_text` is given, it is also
+    translated alongside the image text.
+
+    Returns (translation, source_language_detected).
+        translation is None on failure or no text found.
+        source_language_detected is the detected language name or None.
+    """
+    if not OPENROUTER_API_KEY:
+        logger.error("[Translate] OPENROUTER_API_KEY not set — skipping image translation.")
+        return None, None
+
+    #--- Build the image content part ---
+    if image_bytes is not None:
+        media_type = content_type or "image/png"
+        if media_type not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+            media_type = "image/png"
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_part: dict = {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{b64}"},
+        }
+    elif image_url is not None:
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": image_url},
+        }
+    else:
+        return None, None
+
+    #--- Build prompt — always detect source language ---
+    if accompanying_text:
+        system_prompt = (
+            f"Translate all text visible in the image AND the user-provided text "
+            f"to {target_language}. Also detect the source language of the text. "
+            f'Respond with ONLY a JSON object: {{"translation": "...", "source_language": "English name of source language"}}. '
+            f"No other text. If the image has no readable text, just translate the "
+            f"user text and detect its source language. "
+            f"Preserve @mentions, custom emotes (<:name:id>), and emojis."
+        )
+        user_content = [
+            {"type": "text", "text": accompanying_text},
+            image_part,
+        ]
+    else:
+        system_prompt = (
+            f"Extract all text visible in the image and translate it to {target_language}. "
+            f"Also detect the source language of the text in the image. "
+            f'Respond with ONLY a JSON object: {{"translation": "...", "source_language": "English name of source language"}}. '
+            f"No other text. If there is no readable text in the image, respond with: "
+            f'{{"translation": "", "source_language": "Unknown"}}. '
+            f"Preserve @mentions, custom emotes (<:name:id>), and emojis."
+        )
+        user_content = [image_part]
+
+    payload = {
+        "model": TRANSLATE_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 2000,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                OPENROUTER_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.warning(
+                        "[Translate] OpenRouter image returned %d: %s",
+                        resp.status, error_text[:200],
+                    )
+                    return None, None
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                if content is None:
+                    return None, None
+
+                #--- Parse JSON response ---
+                try:
+                    parsed = json.loads(content)
+                    translation = parsed.get("translation", "").strip() or None
+                    source_lang = parsed.get("source_language", "").strip() or None
+                    #--- Empty translation = no text found ---
+                    if not translation:
+                        return None, source_lang
+                    return translation, source_lang
+                except json.JSONDecodeError:
+                    #--- Fallback: treat raw content as translation ---
+                    logger.warning("[Translate] Image JSON parse failed, using raw content.")
+                    stripped = content.strip()
+                    if not stripped or stripped.upper() == "NO_TEXT":
+                        return None, None
+                    return stripped, None
+    except asyncio.TimeoutError:
+        logger.warning("[Translate] OpenRouter image translation timed out after 60s")
+        return None, None
+    except Exception:
+        logger.exception("[Translate] OpenRouter image translation call failed")
+        return None, None
 #--- Cog: Translate ---
 
 class Translate(commands.Cog):
     """Auto-translate a user's messages in a channel via OpenRouter and
     repost the translation via webhook. Original message stays intact.
     """
+
+    # NOTE: No default_permissions on the Group itself.
+    # Admin-only restriction is set per-command via @app_commands.default_permissions.
+    # /translate manual is left open — access is controlled by role in code.
     translate = app_commands.Group(
         name="translate",
-        description="Toggle auto-translation for specific users in this channel",
-        default_permissions=discord.Permissions(administrator=True),
+        description="Translation settings and manual translation",
     )
+
     def __init__(self, bot):
         self.bot = bot
-        
+
     async def cog_load(self):
         from common.safeguard import init_safeguard
         await init_safeguard(self.bot)
 
     #--- Storage helpers ---
-    # Format: JSON dict { "user_id": "source_language", ... }
-    # Key: translate:{channel_id}
 
     async def _get_translated_users(
         self, guild_id: int, channel_id: int
@@ -265,7 +385,6 @@ class Translate(commands.Cog):
             return {}
         try:
             data = json.loads(raw)
-            #--- JSON keys are strings; convert to int ---
             return {int(k): v for k, v in data.items()}
         except json.JSONDecodeError:
             return {}
@@ -284,6 +403,8 @@ class Translate(commands.Cog):
     #--- /translate default ---
 
     @translate.command(name="default", description="Set the default target language for this channel")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
         language="Default language (e.g. English, Japanese, Spanish)",
     )
@@ -292,7 +413,6 @@ class Translate(commands.Cog):
         interaction: discord.Interaction,
         language: str,
     ):
-        """Set the default translation language for this channel."""
         await set_guild_setting(
             self.bot, interaction.guild_id,
             f"translate_default:{interaction.channel_id}", language
@@ -301,9 +421,36 @@ class Translate(commands.Cog):
             f"Default translation language for this channel set to **{language}**.",
             ephemeral=True,
         )
+
+    #--- /translate show_original ---
+
+    @translate.command(name="show_original", description="Toggle whether translations include a link to the original message (off by default)")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        show="True = show [Original](url) link. False = hide it (default).",
+    )
+    async def translate_show_original(
+        self,
+        interaction: discord.Interaction,
+        show: bool,
+    ):
+        await set_guild_setting(
+            self.bot, interaction.guild_id,
+            f"translate_show_original:{interaction.channel_id}",
+            "true" if show else "false",
+        )
+        status = "shown" if show else "hidden"
+        await interaction.response.send_message(
+            f"Original message link is now **{status}** for translations in this channel.",
+            ephemeral=True,
+        )
+
     #--- /translate user ---
 
     @translate.command(name="user", description="Auto-translate a user's messages in this channel")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
         user="The user to auto-translate",
         language="Source language to translate FROM (e.g. Spanish, Japanese). Omit for auto-detect.",
@@ -314,27 +461,17 @@ class Translate(commands.Cog):
         user: discord.Member,
         language: Optional[str] = None,
     ):
-        """Add a user to this channel's auto-translate list.
-
-        The `language` parameter is the SOURCE language — only messages
-        in that language will be translated. If omitted, all of the
-        user's messages are translated (auto-detect source).
-
-        Target language comes from /translate default (or English).
-        """
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.response.send_message(
                 "Translate only works in text channels and threads.", ephemeral=True
             )
             return
 
-        #--- Resolve target language from channel default ---
         target_language = await get_guild_setting(
             self.bot, interaction.guild_id,
             f"translate_default:{interaction.channel_id}"
         ) or "English"
 
-        #--- Store source language ("auto" if not specified) ---
         source_language = language or "auto"
 
         translated = await self._get_translated_users(
@@ -357,14 +494,16 @@ class Translate(commands.Cog):
                 f"to **{target_language}** in this channel.",
                 ephemeral=True,
             )
+
     #--- /translate remove ---
 
     @translate.command(name="remove", description="Stop auto-translating a user's messages")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(user="The user to remove from auto-translate")
     async def translate_remove(
         self, interaction: discord.Interaction, user: discord.Member
     ):
-        """Remove a user from this channel's auto-translate list."""
         translated = await self._get_translated_users(
             interaction.guild_id, interaction.channel_id
         )
@@ -386,8 +525,9 @@ class Translate(commands.Cog):
     #--- /translate list ---
 
     @translate.command(name="list", description="Show who's being auto-translated in this channel")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     async def translate_list(self, interaction: discord.Interaction):
-        """List all auto-translated users and their source languages in this channel."""
         translated = await self._get_translated_users(
             interaction.guild_id, interaction.channel_id
         )
@@ -397,7 +537,6 @@ class Translate(commands.Cog):
             )
             return
 
-        #--- Get target language for display ---
         target_language = await get_guild_setting(
             self.bot, interaction.guild_id,
             f"translate_default:{interaction.channel_id}"
@@ -418,11 +557,13 @@ class Translate(commands.Cog):
             color=0x3498DB,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
     #--- /translate clear ---
 
     @translate.command(name="clear", description="Remove all auto-translations in this channel")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     async def translate_clear(self, interaction: discord.Interaction):
-        """Remove every user from this channel's auto-translate list."""
         await self._set_translated_users(
             interaction.guild_id, interaction.channel_id, {}
         )
@@ -430,10 +571,300 @@ class Translate(commands.Cog):
             "Cleared all auto-translations in this channel.", ephemeral=True
         )
 
+    #--- /translate role_set ---
+
+    @translate.command(name="role_set", description="Set the role required to use /translate manual")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(role="Role that can use manual translation")
+    async def translate_role_set(self, interaction: discord.Interaction, role: discord.Role):
+        await set_guild_setting(
+            self.bot, interaction.guild_id, "translate_role", str(role.id)
+        )
+        await interaction.response.send_message(
+            f"✅ Manual translation now requires the {role.mention} role.",
+            ephemeral=True,
+        )
+
+    #--- /translate role_clear ---
+
+    @translate.command(name="role_clear", description="Remove the manual translation role requirement")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def translate_role_clear(self, interaction: discord.Interaction):
+        await clear_guild_setting(self.bot, interaction.guild_id, "translate_role")
+        await interaction.response.send_message(
+            "✅ Manual translation role requirement cleared. Anyone can use /translate manual.",
+            ephemeral=True,
+        )
+
+    #--- /translate role_view ---
+
+    @translate.command(name="role_view", description="Show the current manual translation role")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def translate_role_view(self, interaction: discord.Interaction):
+        raw = await get_guild_setting(self.bot, interaction.guild_id, "translate_role")
+        if not raw:
+            await interaction.response.send_message(
+                "No role set — /translate manual is open to everyone.",
+                ephemeral=True,
+            )
+            return
+        try:
+            role_id = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ Stored role ID is invalid. Use /translate role_clear and re-set.",
+                ephemeral=True,
+            )
+            return
+        role = interaction.guild.get_role(role_id)
+        if role:
+            await interaction.response.send_message(
+                f"Manual translation requires: {role.mention}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ Role `{role_id}` no longer exists. Use /translate role_clear and re-set.",
+                ephemeral=True,
+            )
+
+    #--- /translate manual ---
+    # NOTE: No @app_commands.default_permissions — this command is visible
+    # to everyone. Access control is done in-code via the translate_role setting.
+
+    #--- /translate manual ---
+    MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+    @translate.command(name="manual", description="Manually translate text or an image (role-gated)")
+    @app_commands.describe(
+        text="Text to translate",
+        image="Image attachment — text in the image will be translated",
+    )
+    async def translate_manual(
+        self,
+        interaction: discord.Interaction,
+        text: Optional[str] = None,
+        image: Optional[discord.Attachment] = None,
+    ):
+        """Manually translate text and/or an image. Output is an embed
+        showing both the original and the translation. Uses the channel's
+        default target language (set via /translate default, or English).
+        """
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command only works in servers.", ephemeral=True
+            )
+            return
+
+        #--- Role check ---
+        role_raw = await get_guild_setting(self.bot, interaction.guild_id, "translate_role")
+        if role_raw:
+            try:
+                required_role = interaction.guild.get_role(int(role_raw))
+            except ValueError:
+                required_role = None
+            if required_role is None:
+                await interaction.response.send_message(
+                    "⚠️ The configured translate role no longer exists. "
+                    "Ask an admin to re-set it with /translate role_set.",
+                    ephemeral=True,
+                )
+                return
+            if required_role not in interaction.user.roles:
+                await interaction.response.send_message(
+                    f"❌ You need the {required_role.mention} role to use this command.",
+                    ephemeral=True,
+                )
+                return
+
+        #--- Validate: at least one input ---
+        if not text and not image:
+            await interaction.response.send_message(
+                "❌ Provide `text` and/or `image`.",
+                ephemeral=True,
+            )
+            return
+
+        #--- Validate image attachment type ---
+        if image and (not image.content_type or not image.content_type.startswith("image/")):
+            await interaction.response.send_message(
+                "❌ The attached file is not an image.",
+                ephemeral=True,
+            )
+            return
+
+        #--- Validate image size ---
+        if image and image.size > self.MAX_IMAGE_BYTES:
+            await interaction.response.send_message(
+                f"❌ Image is too large ({image.size // 1024 // 1024} MB, "
+                f"max {self.MAX_IMAGE_BYTES // 1024 // 1024} MB).",
+                ephemeral=True,
+            )
+            return
+
+        #--- Defer — API calls may take several seconds ---
+        await interaction.response.defer()
+
+        #--- Resolve target language from channel default ---
+        lang = await get_guild_setting(
+            self.bot, interaction.guild_id,
+            f"translate_default:{interaction.channel_id}"
+        ) or "English"
+
+        #--- Text-only translation ---
+        if text and not image:
+            translated, source_lang = await _translate_text(
+                text, lang, detect_source=True
+            )
+            if not translated:
+                await interaction.followup.send(
+                    "❌ Translation failed. Try again later.",
+                    ephemeral=True,
+                )
+                return
+
+            #--- Truncate to fit embed field limit (1024) ---
+            original_display = text[:1000] + ("…" if len(text) > 1000 else "")
+            translation_display = translated[:1000] + ("…" if len(translated) > 1000 else "")
+
+            #--- Build title with source language ---
+            if source_lang and source_lang.lower() != "unknown":
+                title = f"Translation from {source_lang}"
+            else:
+                title = "Translation"
+
+            embed = discord.Embed(
+                title=title,
+                color=0x3498DB,
+            )
+            embed.add_field(
+                name="Original",
+                value=f"```\n{original_display}\n```",
+                inline=False,
+            )
+            embed.add_field(
+                name="Translation",
+                value=f"```\n{translation_display}\n```",
+                inline=False,
+            )
+            embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            return
+
+        #--- Image translation (with optional accompanying text) ---
+        image_bytes = None
+        content_type = None
+        image_url_for_embed = None
+        if image:
+            try:
+                image_bytes = await image.read()
+                content_type = image.content_type
+                image_url_for_embed = image.url  # Discord CDN URL — safe to display
+            except Exception:
+                logger.exception("[Translate] Failed to read image attachment")
+                await interaction.followup.send(
+                    "❌ Failed to download the image attachment.",
+                    ephemeral=True,
+                )
+                return
+
+        translated, source_lang = await _translate_image(
+            image_bytes=image_bytes,
+            content_type=content_type,
+            image_url=None,
+            target_language=lang,
+            accompanying_text=text,
+        )
+
+        if not translated:
+            if text:
+                #--- Image failed but we have text — try text-only as fallback ---
+                translated, source_lang = await _translate_text(
+                    text, lang, detect_source=True
+                )
+                if translated:
+                    original_display = text[:1000] + ("…" if len(text) > 1000 else "")
+                    translation_display = translated[:1000] + ("…" if len(translated) > 1000 else "")
+
+                    if source_lang and source_lang.lower() != "unknown":
+                        title = f"Translation from {source_lang}"
+                    else:
+                        title = "Translation"
+
+                    embed = discord.Embed(
+                        title=title,
+                        color=0x3498DB,
+                    )
+                    embed.add_field(
+                        name="Original",
+                        value=f"```\n{original_display}\n```",
+                        inline=False,
+                    )
+                    embed.add_field(
+                        name="Translation",
+                        value=f"```\n{translation_display}\n```",
+                        inline=False,
+                    )
+                    embed.set_footer(
+                        text=f"Requested by {interaction.user.display_name} • "
+                             f"Image text could not be extracted"
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
+            await interaction.followup.send(
+                "❌ Translation failed or no readable text was found in the image.",
+                ephemeral=True,
+            )
+            return
+
+        #--- Build embed for image translation ---
+        translation_display = translated[:1000] + ("…" if len(translated) > 1000 else "")
+
+        #--- Build title with source language ---
+        if source_lang and source_lang.lower() != "unknown":
+            title = f"Translation from {source_lang}"
+        else:
+            title = "Translation"
+
+        embed = discord.Embed(
+            title=title,
+            color=0x3498DB,
+        )
+
+        #--- If user also provided text, show it as "Original (text)" field ---
+        if text:
+            original_display = text[:1000] + ("…" if len(text) > 1000 else "")
+            embed.add_field(
+                name="Original (text)",
+                value=f"```\n{original_display}\n```",
+                inline=False,
+            )
+
+        embed.add_field(
+            name="Translation",
+            value=f"```\n{translation_display}\n```",
+            inline=False,
+        )
+
+        #--- "Original Image" label field — appears right above the image ---
+        if image_url_for_embed:
+            embed.add_field(
+                name="Original Image",
+                value="\u200b",  # zero-width space — field name is the label
+                inline=False,
+            )
+            embed.set_image(url=image_url_for_embed)
+
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed)
     #--- /detect (standalone command, not part of the translate group) ---
 
     @app_commands.command(name="detect", description="Detect the language of a specific message")
     @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
         message_id="ID of the message to analyze (right-click → Copy ID)",
     )
@@ -442,20 +873,14 @@ class Translate(commands.Cog):
         interaction: discord.Interaction,
         message_id: str,
     ):
-        """Detect the language of a message using OpenRouter (GLM 5.3 Flash).
-
-        Fetches the specified message by ID and detects its language.
-        """
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.response.send_message(
                 "Detect only works in text channels and threads.", ephemeral=True
             )
             return
 
-        #--- Defer — API call may take a second or two ---
         await interaction.response.defer(ephemeral=True)
 
-        #--- Fetch the message by ID ---
         try:
             msg = await interaction.channel.fetch_message(int(message_id))
         except (discord.NotFound, discord.Forbidden):
@@ -473,14 +898,12 @@ class Translate(commands.Cog):
         target_text = msg.content
         author_display = msg.author.display_name
 
-        #--- Validate text content ---
         if not target_text or not target_text.strip():
             await interaction.followup.send(
                 "That message has no text content to analyze.", ephemeral=True
             )
             return
 
-        #--- Hard cap: skip if too long ---
         if len(target_text) > MAX_MESSAGE_LENGTH:
             await interaction.followup.send(
                 f"Message is too long ({len(target_text)} chars, "
@@ -489,7 +912,6 @@ class Translate(commands.Cog):
             )
             return
 
-        #--- Call OpenRouter for detection ---
         detected = await _detect_language(target_text)
         if detected is None:
             await interaction.followup.send(
@@ -497,7 +919,6 @@ class Translate(commands.Cog):
             )
             return
 
-        #--- Show result with a snippet of the analyzed text ---
         snippet = target_text[:200] + ("..." if len(target_text) > 200 else "")
         embed = discord.Embed(
             title="Language Detection",
@@ -507,22 +928,15 @@ class Translate(commands.Cog):
         )
         embed.add_field(name="Message", value=f"```\n{snippet}\n```", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
     #--- on_message: translate + repost via webhook ---
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """If author is in the auto-translate list for this channel,
-        translate their message via OpenRouter and repost via webhook.
-
-        The original message is NOT deleted — the translation appears
-        alongside it as a webhook message with the user's name and avatar.
-        """
-        #--- Webhook security: intercept all webhook messages ---
         if message.webhook_id is not None:
             await check_webhook_message(message, self.bot)
             return
 
-        #--- Bail on DMs, bots, system messages ---
         if message.guild is None or message.author.bot:
             return
         if message.type not in (
@@ -531,17 +945,15 @@ class Translate(commands.Cog):
         ):
             return
 
-        #--- Only text channels and threads ---
         channel = message.channel
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
 
-        #--- Is this user being auto-translated here? (cheap DB lookup) ---
         translated = await self._get_translated_users(message.guild.id, channel.id)
         if message.author.id not in translated:
             return
+
         #--- Conflict guard: skip if user is also uwulocked in this channel ---
-        #--- (uwu.py deletes the original — we don't want to race with it)
         uwu_raw = await get_guild_setting(
             self.bot, message.guild.id, f"uwulock:{channel.id}"
         )
@@ -549,20 +961,17 @@ class Translate(commands.Cog):
             try:
                 uwu_users = json.loads(uwu_raw)
                 if message.author.id in uwu_users:
-                    return  #--- UwuLock owns this user here ---
+                    return
             except json.JSONDecodeError:
                 pass
 
-        #--- Check for text content ---
         text = message.content.strip()
         if not text:
             return
 
-        #--- Hard cap: skip if message is too long (cost protection) ---
         if len(text) > MAX_MESSAGE_LENGTH:
             return
 
-        #--- Permission check (webhook send only — no deletion needed) ---
         if isinstance(channel, discord.Thread):
             perm_target = channel.parent or channel
         else:
@@ -570,7 +979,6 @@ class Translate(commands.Cog):
         if not bot_can_webhook_send(perm_target):
             return
 
-        #--- Resolve webhook BEFORE calling the API ---
         if isinstance(channel, discord.Thread):
             webhook_channel = channel.parent
             thread_kwarg = {"thread": channel}
@@ -579,22 +987,19 @@ class Translate(commands.Cog):
             thread_kwarg = {}
 
         if webhook_channel is None:
-            return  #--- Parent channel deleted ---
+            return
 
         webhook = await get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
         if webhook is None:
-            return  #--- No webhook available — skip silently ---
+            return
 
-        #--- Get target language from channel default ---
         target_language = await get_guild_setting(
             self.bot, message.guild.id,
             f"translate_default:{channel.id}"
         ) or "English"
 
-        #--- source_language is what's stored per-user (the FROM language) ---
         source_language = translated[message.author.id]
 
-        #--- Call OpenRouter for translation ---
         translated_text, _ = await _translate_text(
             text,
             target_language,
@@ -602,23 +1007,30 @@ class Translate(commands.Cog):
             detect_source=False,
         )
         if translated_text is None or not translated_text.strip():
-            return  #--- Translation failed, empty, or not in source language ---
+            return
 
-        #--- Don't repost if translation is identical to original ---
         if translated_text.strip().lower() == text.strip().lower():
             return
 
-        #--- Build content: translated text + link to original ---
-        msg_link = (
-            f"https://discord.com/channels/"
-            f"{message.guild.id}/{channel.id}/{message.id}"
+        #--- Build content: translated text (+ optional link to original) ---
+        # Default: link is OFF. Only shown if explicitly set to "true".
+        show_original_raw = await get_guild_setting(
+            self.bot, message.guild.id,
+            f"translate_show_original:{channel.id}"
         )
-        content = f"{translated_text[:1900]}\n\n[Original]({msg_link})"
+        show_original = show_original_raw == "true"
 
-        #--- Apply invisible security watermark ---
+        if show_original:
+            msg_link = (
+                f"https://discord.com/channels/"
+                f"{message.guild.id}/{channel.id}/{message.id}"
+            )
+            content = f"{translated_text[:1900]}\n\n[Original]({msg_link})"
+        else:
+            content = translated_text[:1990]
+
         content = watermark_content(content)
 
-        #--- Send translated text via webhook ---
         try:
             await webhook.send(
                 content=content,
