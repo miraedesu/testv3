@@ -93,11 +93,24 @@ class Admin(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
     def _reload_common_modules(self) -> tuple[list[str], list[str]]:
-        """Reloads all common.* modules. Returns (succeeded, failed)."""
+        """Reloads all common.* modules in dependency order.
+        constants.py is reloaded FIRST so that command_toggles and
+        feature_toggles pick up the new OPT_IN sets when they reload.
+
+        Returns (succeeded, failed).
+        """
         succeeded = []
         failed = []
-        common_modules = sorted([name for name in sys.modules if name.startswith("common.")])
-        for mod_name in common_modules:
+
+        # Reload constants FIRST — everything else depends on it
+        priority = ["common.constants"]
+        rest = sorted(
+            name for name in sys.modules
+            if name.startswith("common.") and name not in priority
+        )
+        ordered = priority + rest
+
+        for mod_name in ordered:
             try:
                 importlib.reload(sys.modules[mod_name])
                 succeeded.append(mod_name)
@@ -251,7 +264,15 @@ class Admin(commands.Cog):
                 lines.append("✅ Reloaded cogs: " + ", ".join(f"`{s}`" for s in succeeded))
             if failed:
                 lines.append("❌ Cog failed:\n" + "\n".join(failed))
-
+            # --- Reconcile DB with updated OPT_IN sets ---
+            try:
+                import common.command_toggles
+                import common.feature_toggles
+                await common.feature_toggles.enforce_opt_in_lockdown(self.bot)
+                await common.command_toggles.enforce_opt_in_lockdown(self.bot)
+                lines.append("🔒 OPT-IN lockdown re-enforced with updated config.")
+            except Exception as e:
+                lines.append(f"⚠️ OPT-IN lockdown failed: {e}")
             if sync:
                 try:
                     # Sync global
