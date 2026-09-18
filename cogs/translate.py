@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time as _time
 from typing import Optional
 
 import aiohttp
@@ -34,13 +35,42 @@ logger = logging.getLogger(__name__)
 #--- Constants ---
 
 TRANSLATE_MODEL = "z-ai/glm-5.3-flash"
-MAX_MESSAGE_LENGTH = 1000   # chars — skip translation if message exceeds this
+MAX_MESSAGE_LENGTH = 1000  # chars — skip translation if message exceeds this
 WEBHOOK_NAME = "Translator"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-# Discord CDN domains — only these are accepted for image_url
-_DISCORD_CDN_DOMAINS = ("cdn.discordapp.com", "media.discordapp.net")
+#--- Shared HTTP session (reused across all API calls) ---
+# Avoids DNS+TCP+TLS handshake overhead (~200ms) on every translation call.
+
+_http_session: aiohttp.ClientSession | None = None
+
+
+_PROVIDER_PREFS = {
+    "sort": "latency",
+    "max_price": {"prompt": 0.15, "completion": 0.50},
+    "preferred_max_latency": 2,
+}
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    """Lazily create and reuse a single aiohttp.ClientSession."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+    return _http_session
+
+
+async def _close_session():
+    """Called from cog_unload to clean up the shared session."""
+    global _http_session
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+    _http_session = None
+
 
 #--- OpenRouter API helpers ---
 
@@ -118,58 +148,58 @@ async def _translate_text(
         ],
         "temperature": 0.1,
         "max_tokens": 1000,
+        "provider": _PROVIDER_PREFS,
     }
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                OPENROUTER_URL,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.warning(
-                        "[Translate] OpenRouter returned %d: %s",
-                        resp.status, error_text[:200],
+        session = await _get_session()
+        async with session.post(
+            OPENROUTER_URL,
+            json=payload,
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.warning(
+                    "[Translate] OpenRouter returned %d: %s",
+                    resp.status, error_text[:200],
+                )
+                return None, None
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content is None:
+                logger.warning("[Translate] OpenRouter returned null content.")
+                return None, None
+
+            if source_is_filtered:
+                stripped = content.strip()
+                if stripped.upper() == "SKIP":
+                    return None, None
+                return stripped, source_language
+
+            if detect_source:
+                try:
+                    parsed = json.loads(content)
+                    return (
+                        parsed.get("translation", "").strip() or None,
+                        parsed.get("source_language", "").strip() or None,
                     )
-                    return None, None
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
-                if content is None:
-                    logger.warning("[Translate] OpenRouter returned null content.")
-                    return None, None
+                except json.JSONDecodeError:
+                    logger.warning("[Translate] JSON parse failed, using raw content.")
+                    return content.strip(), None
 
-                if source_is_filtered:
-                    stripped = content.strip()
-                    if stripped.upper() == "SKIP":
-                        return None, None
-                    return stripped, source_language
-
-                if detect_source:
-                    try:
-                        parsed = json.loads(content)
-                        return (
-                            parsed.get("translation", "").strip() or None,
-                            parsed.get("source_language", "").strip() or None,
-                        )
-                    except json.JSONDecodeError:
-                        logger.warning("[Translate] JSON parse failed, using raw content.")
-                        return content.strip(), None
-
-                return content.strip(), None
+            return content.strip(), None
     except asyncio.TimeoutError:
         logger.warning("[Translate] OpenRouter timed out after 30s (text: %s)", text[:100])
         return None, None
     except Exception:
         logger.exception("[Translate] OpenRouter translation call failed")
         return None, None
+
 
 async def _detect_language(text: str) -> Optional[str]:
     """Send text to OpenRouter (GLM 5.3 Flash) for language detection.
@@ -195,40 +225,40 @@ async def _detect_language(text: str) -> Optional[str]:
         ],
         "temperature": 0,
         "max_tokens": 50,
+        "provider": _PROVIDER_PREFS,
     }
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                OPENROUTER_URL,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.warning(
-                        "[Translate] OpenRouter returned %d: %s",
-                        resp.status, error_text[:200],
-                    )
-                    return None
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
-                if content is None:
-                    logger.warning("[Translate] OpenRouter returned null content for detection.")
-                    return None
-                return content.strip()
+        session = await _get_session()
+        async with session.post(
+            OPENROUTER_URL,
+            json=payload,
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.warning(
+                    "[Translate] OpenRouter returned %d: %s",
+                    resp.status, error_text[:200],
+                )
+                return None
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content is None:
+                logger.warning("[Translate] OpenRouter returned null content for detection.")
+                return None
+            return content.strip()
     except asyncio.TimeoutError:
-        logger.warning("[Translate] OpenRouter detection timed out after 30s (text: %s)", text[:100])
+        logger.warning("[Translate] OpenRouter detection timed out (text: %s)", text[:100])
         return None
     except Exception:
         logger.exception("[Translate] OpenRouter detection call failed")
         return None
+
 
 async def _translate_image(
     image_bytes: bytes | None,
@@ -303,55 +333,57 @@ async def _translate_image(
         ],
         "temperature": 0.1,
         "max_tokens": 2000,
+        "provider": _PROVIDER_PREFS,
     }
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                OPENROUTER_URL,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.warning(
-                        "[Translate] OpenRouter image returned %d: %s",
-                        resp.status, error_text[:200],
-                    )
-                    return None, None
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
-                if content is None:
-                    return None, None
+        session = await _get_session()
+        async with session.post(
+            OPENROUTER_URL,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=60),  # override session default (30s) — image OCR is slower
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.warning(
+                    "[Translate] OpenRouter image returned %d: %s",
+                    resp.status, error_text[:200],
+                )
+                return None, None
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content is None:
+                return None, None
 
-                #--- Parse JSON response ---
-                try:
-                    parsed = json.loads(content)
-                    translation = parsed.get("translation", "").strip() or None
-                    source_lang = parsed.get("source_language", "").strip() or None
-                    #--- Empty translation = no text found ---
-                    if not translation:
-                        return None, source_lang
-                    return translation, source_lang
-                except json.JSONDecodeError:
-                    #--- Fallback: treat raw content as translation ---
-                    logger.warning("[Translate] Image JSON parse failed, using raw content.")
-                    stripped = content.strip()
-                    if not stripped or stripped.upper() == "NO_TEXT":
-                        return None, None
-                    return stripped, None
+            #--- Parse JSON response ---
+            try:
+                parsed = json.loads(content)
+                translation = parsed.get("translation", "").strip() or None
+                source_lang = parsed.get("source_language", "").strip() or None
+                #--- Empty translation = no text found ---
+                if not translation:
+                    return None, source_lang
+                return translation, source_lang
+            except json.JSONDecodeError:
+                #--- Fallback: treat raw content as translation ---
+                logger.warning("[Translate] Image JSON parse failed, using raw content.")
+                stripped = content.strip()
+                if not stripped or stripped.upper() == "NO_TEXT":
+                    return None, None
+                return stripped, None
     except asyncio.TimeoutError:
         logger.warning("[Translate] OpenRouter image translation timed out after 60s")
         return None, None
     except Exception:
         logger.exception("[Translate] OpenRouter image translation call failed")
         return None, None
+
+
 #--- Cog: Translate ---
 
 class Translate(commands.Cog):
@@ -367,14 +399,73 @@ class Translate(commands.Cog):
         description="Translation settings and manual translation",
     )
 
+    #--- Cache TTL: 60 seconds ---
+    _CACHE_TTL = 60
+
     def __init__(self, bot):
         self.bot = bot
+        #--- In-memory cache: (guild_id, channel_id, key) → (value, timestamp) ---
+        self._settings_cache: dict[tuple[int, int, str], tuple[str | None, float]] = {}
+        #--- Translated users cache: (guild_id, channel_id) → (dict, timestamp) ---
+        self._users_cache: dict[tuple[int, int], tuple[dict[int, str], float]] = {}
 
     async def cog_load(self):
         from common.safeguard import init_safeguard
         await init_safeguard(self.bot)
 
-    #--- Storage helpers ---
+    async def cog_unload(self):
+        await _close_session()
+
+    #--- Cached DB lookups ---
+
+    async def _cached_get_setting(
+        self, guild_id: int, channel_id: int, key: str
+    ) -> str | None:
+        """Guild setting lookup with 60s in-memory cache."""
+        cache_key = (guild_id, channel_id, key)
+        cached = self._settings_cache.get(cache_key)
+        if cached is not None:
+            value, ts = cached
+            if _time.monotonic() - ts < self._CACHE_TTL:
+                return value
+        value = await get_guild_setting(self.bot, guild_id, key)
+        self._settings_cache[cache_key] = (value, _time.monotonic())
+        return value
+
+    async def _cached_get_translated_users(
+        self, guild_id: int, channel_id: int
+    ) -> dict[int, str]:
+        """Translated users dict with 60s in-memory cache."""
+        cache_key = (guild_id, channel_id)
+        cached = self._users_cache.get(cache_key)
+        if cached is not None:
+            users, ts = cached
+            if _time.monotonic() - ts < self._CACHE_TTL:
+                return users
+        raw = await get_guild_setting(self.bot, guild_id, f"translate:{channel_id}")
+        if not raw:
+            users = {}
+        else:
+            try:
+                data = json.loads(raw)
+                users = {int(k): v for k, v in data.items()}
+            except json.JSONDecodeError:
+                users = {}
+        self._users_cache[cache_key] = (users, _time.monotonic())
+        return users
+
+    def _invalidate_cache(self, guild_id: int, channel_id: int):
+        """Clear all cached settings + users for a channel.
+        Called after any settings change."""
+        to_delete = [
+            k for k in self._settings_cache
+            if k[0] == guild_id and k[1] == channel_id
+        ]
+        for k in to_delete:
+            del self._settings_cache[k]
+        self._users_cache.pop((guild_id, channel_id), None)
+
+    #--- Storage helpers (used by commands, not on_message hot path) ---
 
     async def _get_translated_users(
         self, guild_id: int, channel_id: int
@@ -417,6 +508,7 @@ class Translate(commands.Cog):
             self.bot, interaction.guild_id,
             f"translate_default:{interaction.channel_id}", language
         )
+        self._invalidate_cache(interaction.guild_id, interaction.channel_id)
         await interaction.response.send_message(
             f"Default translation language for this channel set to **{language}**.",
             ephemeral=True,
@@ -440,6 +532,7 @@ class Translate(commands.Cog):
             f"translate_show_original:{interaction.channel_id}",
             "true" if show else "false",
         )
+        self._invalidate_cache(interaction.guild_id, interaction.channel_id)
         status = "shown" if show else "hidden"
         await interaction.response.send_message(
             f"Original message link is now **{status}** for translations in this channel.",
@@ -481,6 +574,7 @@ class Translate(commands.Cog):
         await self._set_translated_users(
             interaction.guild_id, interaction.channel_id, translated
         )
+        self._invalidate_cache(interaction.guild_id, interaction.channel_id)
 
         if language:
             await interaction.response.send_message(
@@ -518,6 +612,7 @@ class Translate(commands.Cog):
         await self._set_translated_users(
             interaction.guild_id, interaction.channel_id, translated
         )
+        self._invalidate_cache(interaction.guild_id, interaction.channel_id)
         await interaction.response.send_message(
             f"Stopped auto-translating {user.mention}.", ephemeral=True
         )
@@ -567,6 +662,7 @@ class Translate(commands.Cog):
         await self._set_translated_users(
             interaction.guild_id, interaction.channel_id, {}
         )
+        self._invalidate_cache(interaction.guild_id, interaction.channel_id)
         await interaction.response.send_message(
             "Cleared all auto-translations in this channel.", ephemeral=True
         )
@@ -632,10 +728,7 @@ class Translate(commands.Cog):
             )
 
     #--- /translate manual ---
-    # NOTE: No @app_commands.default_permissions — this command is visible
-    # to everyone. Access control is done in-code via the translate_role setting.
 
-    #--- /translate manual ---
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 
     @translate.command(name="manual", description="Manually translate text or an image (role-gated)")
@@ -860,6 +953,7 @@ class Translate(commands.Cog):
 
         embed.set_footer(text=f"Requested by {interaction.user.display_name}")
         await interaction.followup.send(embed=embed)
+
     #--- /detect (standalone command, not part of the translate group) ---
 
     @app_commands.command(name="detect", description="Detect the language of a specific message")
@@ -923,7 +1017,7 @@ class Translate(commands.Cog):
         embed = discord.Embed(
             title="Language Detection",
             description=f"**{author_display}**'s message appears to be in "
-                        f"**{detected}**.",
+            f"**{detected}**.",
             color=0x3498DB,
         )
         embed.add_field(name="Message", value=f"```\n{snippet}\n```", inline=False)
@@ -949,13 +1043,16 @@ class Translate(commands.Cog):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
 
-        translated = await self._get_translated_users(message.guild.id, channel.id)
+        #--- Cached: translated users (0ms on cache hit) ---
+        translated = await self._cached_get_translated_users(
+            message.guild.id, channel.id
+        )
         if message.author.id not in translated:
             return
 
-        #--- Conflict guard: skip if user is also uwulocked in this channel ---
-        uwu_raw = await get_guild_setting(
-            self.bot, message.guild.id, f"uwulock:{channel.id}"
+        #--- Cached: uwulock conflict check (0ms on cache hit) ---
+        uwu_raw = await self._cached_get_setting(
+            message.guild.id, channel.id, f"uwulock:{channel.id}"
         )
         if uwu_raw:
             try:
@@ -989,23 +1086,45 @@ class Translate(commands.Cog):
         if webhook_channel is None:
             return
 
-        webhook = await get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
-        if webhook is None:
-            return
-
-        target_language = await get_guild_setting(
-            self.bot, message.guild.id,
+        #--- Cached: target language + show_original (0ms on cache hit) ---
+        target_language_raw = await self._cached_get_setting(
+            message.guild.id, channel.id,
             f"translate_default:{channel.id}"
-        ) or "English"
+        )
+        target_language = target_language_raw or "English"
+
+        show_original_raw = await self._cached_get_setting(
+            message.guild.id, channel.id,
+            f"translate_show_original:{channel.id}"
+        )
 
         source_language = translated[message.author.id]
 
-        translated_text, _ = await _translate_text(
-            text,
-            target_language,
-            source_language=source_language,
-            detect_source=False,
+        #--- CONCURRENT: webhook fetch + translation API call ---
+        # These are the two slow operations. Running them in parallel
+        # saves ~100ms (webhook fetch no longer blocks translation start).
+        # get_managed_webhook has its own in-memory cache in safeguard.py,
+        # so on cache hit this is nearly instant.
+        webhook_task = asyncio.ensure_future(
+            get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
         )
+        translate_task = asyncio.ensure_future(
+            _translate_text(
+                text,
+                target_language,
+                source_language=source_language,
+                detect_source=False,
+            )
+        )
+
+        webhook, translated_text = await asyncio.gather(
+            webhook_task,
+            translate_task,
+        )
+
+        if webhook is None:
+            return
+
         if translated_text is None or not translated_text.strip():
             return
 
@@ -1013,11 +1132,6 @@ class Translate(commands.Cog):
             return
 
         #--- Build content: translated text (+ optional link to original) ---
-        # Default: link is OFF. Only shown if explicitly set to "true".
-        show_original_raw = await get_guild_setting(
-            self.bot, message.guild.id,
-            f"translate_show_original:{channel.id}"
-        )
         show_original = show_original_raw == "true"
 
         if show_original:
@@ -1049,6 +1163,7 @@ class Translate(commands.Cog):
                 "(message id %s, channel %s, author %s).",
                 message.id, channel, message.author,
             )
+
 
 #--- Cog entry point ---
 
