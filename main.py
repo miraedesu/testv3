@@ -106,7 +106,7 @@ class MyBot(commands.Bot):
         # If it's a fresh install (DB is empty), load a default list
         if not cogs_to_load:
             cogs_to_load = [
-                "cogs.reactions", "cogs.settings", "cogs.welcome", "cogs.emotes",
+                "cogs.reactions", "cogs.settings", "cogs.welcome", "cogs.app_emotes",
                 "cogs.moderation", "cogs.member_events", "cogs.permcheck", "cogs.admin",
                 "cogs.anime", "cogs.profile", "cogs.whois", "cogs.misc", "cogs.guild_settings", "cogs.bot_log","cogs.boost_list","cogs.uwu","cogs.phash",
             ]
