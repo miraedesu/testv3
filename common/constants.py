@@ -53,7 +53,7 @@ OPT_IN_COMMANDS = {
     "whois_list",
     "phash",
     "cr",
-    "emote",
+    "appemote",
     "guild_settings boost_edit",
     "guild_settings boost_list_mention",
     "guild_settings boost_list_mention_view",
