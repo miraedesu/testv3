@@ -47,9 +47,19 @@ _http_session: aiohttp.ClientSession | None = None
 
 
 _PROVIDER_PREFS = {
-    "sort": "latency",
-    "max_price": {"prompt": 0.15, "completion": 0.50},
-    "preferred_max_latency": 2,
+    # NO "sort" — let OpenRouter's default load balancing work.
+    # Default behavior: prioritizes providers without recent outages (30s window),
+    # then load-balances by price. This naturally avoids Together's 68% uptime.
+    "preferred_max_latency": {"p90": 3},
+    # ^ Deprioritize providers whose p90 latency exceeds 3s.
+    #   Evaluates a rolling 5-minute window. Soft filter — providers
+    #   above the threshold move to the END of the candidate list,
+    #   they're not excluded. If all fast providers are down, slow
+    #   ones still serve the request rather than failing.
+    "preferred_min_throughput": {"p90": 30},
+    # ^ Deprioritize providers below 30 tokens/sec at p90.
+    #   Filters out sluggish generators like DeepInfra (29 tps),
+    #   io.net (7 tps), Morph (3 tps) without hard-excluding them.
 }
 
 
@@ -136,7 +146,9 @@ async def _translate_text(
             "or creative/phonetic spellings — treat these as valid "
             "representations of their respective languages and translate "
             "the intended meaning. "
-            "Output ONLY the translation — no explanations, no prefixes. "
+            f"If the text is ALREADY in {target_language}, "
+            f'respond with only "SKIP". '
+            "Output ONLY the translation or the word SKIP — no explanations, no prefixes. "
             "Preserve any @mentions, custom emotes (<:name:id>), and emojis exactly as they are."
         )
 
@@ -154,7 +166,49 @@ async def _translate_text(
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
     }
+    #Debuging resp time
+    # try:
+    #     session = await _get_session()
+    #     _t0 = _time.monotonic()
+    #     async with session.post(
+    #         OPENROUTER_URL,
+    #         json=payload,
+    #         headers=headers,
+    #     ) as resp:
+    #         _t_resp = _time.monotonic()
+    #         logger.info(
+    #             "[Translate] OpenRouter response status=%d in %.2fs",
+    #             resp.status, _t_resp - _t0,
+    #         )
+    #         if resp.status != 200:
+    #             error_text = await resp.text()
+    #             logger.warning(
+    #                 "[Translate] OpenRouter returned %d: %s",
+    #                 resp.status, error_text[:200],
+    #             )
+    #             return None, None
+    #         data = await resp.json()
+    #         _t_json = _time.monotonic()
+    #         content = data["choices"][0]["message"]["content"]
 
+    #         # --- Log which provider served the request ---
+    #         _raw_provider = data.get("provider", "unknown")
+    #         if isinstance(_raw_provider, dict):
+    #             provider_used = _raw_provider.get("name", "unknown")
+    #         else:
+    #             provider_used = str(_raw_provider)
+    #         logger.info(
+    #             "[Translate] Provider=%s | total=%.2fs (resp=%.2fs + json=%.2fs) | text=%s",
+    #             provider_used,
+    #             _t_json - _t0,
+    #             _t_resp - _t0,
+    #             _t_json - _t_resp,
+    #             text[:60],
+    #         )
+
+    #         if content is None:
+    #             logger.warning("[Translate] OpenRouter returned null content.")
+    #             return None, None
     try:
         session = await _get_session()
         async with session.post(
@@ -175,24 +229,26 @@ async def _translate_text(
                 logger.warning("[Translate] OpenRouter returned null content.")
                 return None, None
 
+            #--- Check for SKIP first (applies to filtered + auto modes) ---
+            stripped = content.strip()
+            if stripped.upper() == "SKIP":
+                return None, None
+
             if source_is_filtered:
-                stripped = content.strip()
-                if stripped.upper() == "SKIP":
-                    return None, None
                 return stripped, source_language
 
             if detect_source:
                 try:
-                    parsed = json.loads(content)
+                    parsed = json.loads(stripped)
                     return (
                         parsed.get("translation", "").strip() or None,
                         parsed.get("source_language", "").strip() or None,
                     )
                 except json.JSONDecodeError:
                     logger.warning("[Translate] JSON parse failed, using raw content.")
-                    return content.strip(), None
+                    return stripped, None
 
-            return content.strip(), None
+            return stripped, None
     except asyncio.TimeoutError:
         logger.warning("[Translate] OpenRouter timed out after 30s (text: %s)", text[:100])
         return None, None
@@ -1105,6 +1161,79 @@ class Translate(commands.Cog):
         # saves ~100ms (webhook fetch no longer blocks translation start).
         # get_managed_webhook has its own in-memory cache in safeguard.py,
         # so on cache hit this is nearly instant.
+        # --- CONCURRENT: webhook fetch + translation API call ---
+        #debug resp time
+        # _t_gather_start = _time.monotonic()
+        # webhook_task = asyncio.ensure_future(
+        #     get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
+        # )
+        # translate_task = asyncio.ensure_future(
+        #     _translate_text(
+        #         text,
+        #         target_language,
+        #         source_language=source_language,
+        #         detect_source=False,
+        #     )
+        # )
+
+        # webhook, (translated_text, _) = await asyncio.gather(
+        #     webhook_task,
+        #     translate_task,
+        # )
+        # _t_gather_end = _time.monotonic()
+
+        # if webhook is None:
+        #     return
+
+        # if translated_text is None or not translated_text.strip():
+        #     return
+
+        # if translated_text.strip().lower() == text.strip().lower():
+        #     return
+
+        # # --- Build content ---
+        # show_original = show_original_raw == "true"
+        # if show_original:
+        #     msg_link = (
+        #         f"https://discord.com/channels/"
+        #         f"{message.guild.id}/{channel.id}/{message.id}"
+        #     )
+        #     content = f"{translated_text[:1900]}\n\n[Original]({msg_link})"
+        # else:
+        #     content = translated_text[:1990]
+        # content = watermark_content(content)
+
+        # _t_send_start = _time.monotonic()
+        # try:
+        #     await webhook.send(
+        #         content=content,
+        #         username=message.author.display_name,
+        #         avatar_url=message.author.display_avatar.url,
+        #         allowed_mentions=discord.AllowedMentions(
+        #             everyone=False,
+        #             roles=False,
+        #             users=True,
+        #         ),
+        #         **thread_kwarg,
+        #     )
+        #     _t_send_end = _time.monotonic()
+        #     logger.info(
+        #         "[Translate] on_message total: gather=%.2fs | webhook_send=%.2fs | "
+        #         "author=%s channel=%s",
+        #         _t_gather_end - _t_gather_start,
+        #         _t_send_end - _t_send_start,
+        #         message.author.display_name,
+        #         channel.id,
+        #     )
+        # except Exception:
+        #     logger.exception(
+        #         "[Translate] Webhook send failed "
+        #         "(message id %s, channel %s, author %s).",
+        #         message.id, channel, message.author,
+        #     )
+
+
+
         webhook_task = asyncio.ensure_future(
             get_managed_webhook(webhook_channel, WEBHOOK_NAME, self.bot)
         )
@@ -1117,7 +1246,7 @@ class Translate(commands.Cog):
             )
         )
 
-        webhook, translated_text = await asyncio.gather(
+        webhook, (translated_text, _) = await asyncio.gather(
             webhook_task,
             translate_task,
         )

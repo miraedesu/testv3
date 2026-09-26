@@ -8,7 +8,6 @@ import random
 import re
 import time
 from collections import deque
-from typing import Optional
 
 import discord
 from discord import app_commands
@@ -87,6 +86,13 @@ ACTIONS = [
 WEBHOOK_NAME = "UwuLock"
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
+#--- Vowel stripping (for /uwulock add vow:True) ---
+VOWEL_RE = re.compile(r"[aeiouyAEIOUY]")
+
+
+def _strip_vowels(text: str) -> str:
+    """Remove all vowels (a, e, i, o, u) from text, preserving consonants and case."""
+    return VOWEL_RE.sub("", text)
 #--- Circuit breaker: tracks recent deletions across all channels ---
 _deletion_log: deque[float] = deque()
 _CIRCUIT_MAX_DELETIONS = 20       # max deletions in the window
@@ -292,32 +298,54 @@ class UwuLock(commands.Cog):
 
     #--- Storage helpers ---
 
-    async def _get_locked_users(self, guild_id: int, channel_id: int) -> list[int]:
-        """Read the JSON list of uwulocked user IDs for this channel."""
+    async def _get_locked_users(self, guild_id: int, channel_id: int) -> dict[int, dict]:
+        """Read the JSON dict of uwulocked user IDs and their options for this channel.
+
+        Returns ``{user_id: {"vow": bool, ...}}``.
+        Handles legacy list-of-ids format for backward compatibility.
+        """
         raw = await get_guild_setting(self.bot, guild_id, f"uwulock:{channel_id}")
         if not raw:
-            return []
+            return {}
         try:
-            return json.loads(raw)
+            data = json.loads(raw)
         except json.JSONDecodeError:
-            return []
+            return {}
+
+        #--- Backward compat: old format was a plain list of ints ---
+        if isinstance(data, list):
+            return {uid: {"vow": False} for uid in data}
+
+        #--- New format: {str(user_id): {options}} ---
+        result: dict[int, dict] = {}
+        for k, v in data.items():
+            try:
+                result[int(k)] = v if isinstance(v, dict) else {"vow": False}
+            except (ValueError, TypeError):
+                continue
+        return result
 
     async def _set_locked_users(
-        self, guild_id: int, channel_id: int, users: list[int]
+        self, guild_id: int, channel_id: int, users: dict[int, dict]
     ) -> None:
-        """Write the JSON list of uwulocked user IDs. Clears the key if list is empty."""
+        """Write the JSON dict of uwulocked users. Clears the key if dict is empty."""
         if users:
+            serializable = {str(uid): opts for uid, opts in users.items()}
             await set_guild_setting(
-                self.bot, guild_id, f"uwulock:{channel_id}", json.dumps(users)
+                self.bot, guild_id, f"uwulock:{channel_id}", json.dumps(serializable)
             )
         else:
             await clear_guild_setting(self.bot, guild_id, f"uwulock:{channel_id}")
-
     #--- /uwulock add ---
 
     @uwulock.command(name="add", description="Uwuify a user's text messages in this channel")
-    @app_commands.describe(user="The user to uwulock")
-    async def uwulock_add(self, interaction: discord.Interaction, user: discord.Member):
+    @app_commands.describe(
+        user="The user to uwulock",
+        vow="lzk",
+    )
+    async def uwulock_add(
+        self, interaction: discord.Interaction, user: discord.Member, vow: bool = False
+    ):
         """Add a user to this channel's uwulock list."""
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.response.send_message(
@@ -332,12 +360,13 @@ class UwuLock(commands.Cog):
             )
             return
 
-        locked.append(user.id)
+        locked[user.id] = {"vow": vow}
         await self._set_locked_users(interaction.guild_id, interaction.channel_id, locked)
-        await interaction.response.send_message(
-            f"Uwulocked {user.mention} in this channel. OwO", ephemeral=True
-        )
 
+        vow_note = " (vowels stripped)" if vow else ""
+        await interaction.response.send_message(
+            f"Uwulocked {user.mention} in this channel{vow_note}. OwO", ephemeral=True
+        )
     #--- /uwulock remove ---
 
     @uwulock.command(name="remove", description="Stop uwuifying a user's messages in this channel")
@@ -351,12 +380,11 @@ class UwuLock(commands.Cog):
             )
             return
 
-        locked.remove(user.id)
+        del locked[user.id]
         await self._set_locked_users(interaction.guild_id, interaction.channel_id, locked)
         await interaction.response.send_message(
             f"Un-uwulocked {user.mention}. Back to normal. UwU", ephemeral=True
         )
-
     #--- /uwulock list ---
 
     @uwulock.command(name="list", description="Show who's uwulocked in this channel")
@@ -370,10 +398,11 @@ class UwuLock(commands.Cog):
             return
 
         lines = []
-        for uid in locked:
+        for uid, opts in locked.items():
             member = interaction.guild.get_member(uid)
             name = member.display_name if member else f"Unknown ({uid})"
-            lines.append(f"• {name}")
+            vow_tag = " [vow]" if opts.get("vow") else ""
+            lines.append(f"• {name}{vow_tag}")
 
         embed = discord.Embed(
             title="UwuLock — this channel",
@@ -381,19 +410,17 @@ class UwuLock(commands.Cog):
             color=0xFFC0CB,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
     #--- /uwulock clear ---
 
     @uwulock.command(name="clear", description="Remove all uwulocks in this channel")
     async def uwulock_clear(self, interaction: discord.Interaction):
         """Remove every user from this channel's uwulock list."""
-        await self._set_locked_users(interaction.guild_id, interaction.channel_id, [])
+        await self._set_locked_users(interaction.guild_id, interaction.channel_id, {})
         await interaction.response.send_message(
             "Cleared all uwulocks in this channel. :3", ephemeral=True
         )
 
     #--- on_message: uwuify + repost ---
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """If author is uwulocked in this channel, uwuify and repost via webhook.
@@ -401,6 +428,10 @@ class UwuLock(commands.Cog):
         Delete-first for snappy UX. Webhook is resolved BEFORE deletion so the
         common failure case (no webhook available) doesn't lose the message.
         Circuit breaker prevents runaway deletion if something goes wrong.
+
+        If the user's ``vow`` option is True, ONLY vowels are stripped —
+        the uwuify pipeline (emote replacement, letter swaps, faces, actions)
+        is skipped entirely.
         """
         #--- Circuit breaker latch ---
         if _CIRCUIT_TRIPPED:
@@ -411,10 +442,16 @@ class UwuLock(commands.Cog):
             await check_webhook_message(message, self.bot)
             return
 
-        #--- Bail on DMs, bots, system messages ---
+        #--- Bail on DMs, bots ---
         if message.guild is None or message.author.bot:
             return
-        if message.type != discord.MessageType.default:
+
+        #--- Allow regular messages AND replies; skip other system messages ---
+        _allowed_types = {discord.MessageType.default}
+        _reply_type = getattr(discord.MessageType, "reply", None)
+        if _reply_type is not None:
+            _allowed_types.add(_reply_type)
+        if message.type not in _allowed_types:
             return
 
         #--- Only text channels and threads ---
@@ -424,7 +461,8 @@ class UwuLock(commands.Cog):
 
         #--- Is this user uwulocked here? (cheap DB lookup, run BEFORE perms) ---
         locked = await self._get_locked_users(message.guild.id, channel.id)
-        if message.author.id not in locked:
+        user_opts = locked.get(message.author.id)
+        if user_opts is None:
             return
 
         #--- Per-user-triggered safety check (only runs when needed) ---
@@ -443,9 +481,15 @@ class UwuLock(commands.Cog):
         if not text_stripped:
             return
 
-        #--- Uwuify (async — includes emote replacement) ---
-        uwu_text = await uwuify_message(self.bot, text, message.guild.id)
-        if not uwu_text:
+        #--- Branch: vow mode (vowels only) vs full uwuify ---
+        if user_opts.get("vow"):
+            #--- VOW MODE: strip vowels only, no uwuify pipeline ---
+            output_text = _strip_vowels(text_stripped)
+        else:
+            #--- FULL UWUIFY: emote replacement + letter swaps + faces + actions ---
+            output_text = await uwuify_message(self.bot, text, message.guild.id)
+
+        if not output_text:
             return
 
         #--- Circuit breaker check BEFORE any deletion ---
@@ -477,10 +521,10 @@ class UwuLock(commands.Cog):
             logger.exception("[UwuLock] Failed to delete message %s", message.id)
             return
 
-        #--- Send uwuified text via webhook ---
+        #--- Send processed text via webhook ---
         try:
             await webhook.send(
-                content=watermark_content(uwu_text),
+                content=watermark_content(output_text),
                 username=message.author.display_name,
                 avatar_url=message.author.display_avatar.url,
                 allowed_mentions=discord.AllowedMentions(

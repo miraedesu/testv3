@@ -126,7 +126,25 @@ class Moderation(commands.Cog):
 
     def cog_unload(self):
         self.cleanup_caches.cancel()
-
+        
+    async def _get_readimg_url(self) -> str | None:
+        """Uploads readimg.png once and caches the Discord CDN URL.
+        All subsequent log messages reference the URL instead of
+        re-uploading the file every time — avoids attachment rate limits."""
+        if self._readimg_url:
+            return self._readimg_url
+        try:
+            channel = self.bot.get_channel(DMLOG_CHANNEL_ID)
+            if channel is None:
+                channel = await self.bot.fetch_channel(DMLOG_CHANNEL_ID)
+            if channel is not None:
+                msg = await channel.send(file=discord.File(readimg))
+                if msg.attachments:
+                    self._readimg_url = msg.attachments[0].url
+                    logger.info(f"[Moderation] Cached readimg CDN URL: {self._readimg_url}")
+        except Exception as e:
+            logger.error(f"[Moderation] Failed to cache readimg URL: {e}")
+        return self._readimg_url
     @commands.Cog.listener()
     async def on_ready(self):
         global _recycle_url
@@ -887,7 +905,9 @@ class Moderation(commands.Cog):
 
         embed = discord.Embed(title="🗑️ Message Deleted",
                               color=discord.Color.red(), timestamp=now)
-        embed.set_thumbnail(url=f"attachment://{os.path.basename(readimg)}")
+        readimg_url = await self._get_readimg_url()
+        if readimg_url:
+            embed.set_thumbnail(url=readimg_url)
 
         if cached is not None:
             embed.set_author(name=f"{cached.author} ({cached.author.id})",
@@ -916,7 +936,7 @@ class Moderation(commands.Cog):
                 name="Content", value="*(message wasn't cached -- content unavailable)*", inline=False)
 
         try:
-            await log_channel.send(embed=embed, file=discord.File(readimg))
+            await log_channel.send(embed=embed)
         except discord.Forbidden:
             logger.info(
                 f"Permission Denied: Cannot send logs to #{log_channel.name}")
@@ -983,7 +1003,9 @@ class Moderation(commands.Cog):
                               description=f"[Jump to Message]({jump_url})",
                               color=discord.Color.purple(),
                               timestamp=discord.utils.utcnow())
-        embed.set_thumbnail(url=f"attachment://{os.path.basename(readimg)}")
+        readimg_url = await self._get_readimg_url()
+        if readimg_url:
+            embed.set_thumbnail(url=readimg_url)
 
         if cached is not None:
             embed.set_author(name=f"{cached.author} ({cached.author.id})",
@@ -1011,7 +1033,7 @@ class Moderation(commands.Cog):
                         value=new_display[:1024], inline=False)
 
         try:
-            await log_channel.send(embed=embed, file=discord.File(readimg))
+            await log_channel.send(embed=embed)
         except discord.Forbidden:
             logger.info(
                 f"Permission Denied: Cannot send logs to #{log_channel.name}")

@@ -37,7 +37,7 @@ class EmojiPagination(discord.ui.View):
         end = start + EMOJI_PER_PAGE
         entries = self.data[start:end]
 
-        lines = [f"{emoji_str} **{name}** — `{emoji_str}`" for _id,
+        lines = [f"{emoji_str} **{name}** — ```{emoji_str}```" for _id,
                  name, emoji_str, _animated in entries]
         description = "\n\n".join(lines) or "No entries on this page."
 
