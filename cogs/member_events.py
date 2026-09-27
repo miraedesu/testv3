@@ -273,7 +273,6 @@ class MemberEvents(commands.Cog):
             
         # 10 minute buffer (600 seconds)
         self._snapshot_timers[guild.id] = asyncio.create_task(self._save_snapshot(guild))
-
     async def _save_snapshot(self, guild: discord.Guild):
         try:
             await asyncio.sleep(600)
@@ -286,9 +285,30 @@ class MemberEvents(commands.Cog):
         layout = self._capture_layout(guild)
         layout_json = json.dumps(layout)
 
+        #--- Fast path: unchanged since the last state we saw ---
         if self._last_layout.get(guild.id) == layout_json:
-            logger.info(f"[History] Channel layout in {guild.name} reverted to original state. Skipping snapshot.")
+            logger.info(f"[History] Channel layout in {guild.name} unchanged. Skipping snapshot.")
             return
+
+        #--- Revert guard: was this EXACT layout ever recorded before? ---
+        #--- Old code only compared vs the LAST snapshot, so
+        #--- "move out → snapshot → move back" always saved again and
+        #--- ping-ponged 2 new snapshots per out-and-back. ---
+        async with self.bot.db.execute(
+            "SELECT snapshot_data FROM channel_snapshots WHERE guild_id = ?",
+            (guild.id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for (data_str,) in rows:
+            try:
+                if json.loads(data_str) == layout:
+                    self._last_layout[guild.id] = layout_json  # keep memory in sync
+                    logger.info(
+                        f"[History] Channel layout in {guild.name} reverted to a "
+                        f"previously recorded state. Skipping snapshot.")
+                    return
+            except (json.JSONDecodeError, TypeError):
+                continue
 
         now_ts = int(discord.utils.utcnow().timestamp())
 
@@ -305,16 +325,28 @@ class MemberEvents(commands.Cog):
         )
         await self.bot.db.commit()
 
+        #--- Show WHAT changed so future embeds aren't mystery alarms ---
+        changes: list[str] = []
+        try:
+            old_layout = json.loads(self._last_layout.get(guild.id, "null"))
+            if isinstance(old_layout, dict):
+                changes = self._diff_layouts(old_layout, layout)
+        except json.JSONDecodeError:
+            pass
         self._last_layout[guild.id] = layout_json
 
         log_channel = await get_log_channel(self.bot, guild.id, "server-log")
         if log_channel:
+            desc = ""
+            if changes:
+                desc += "\n".join(f"• {c}" for c in changes[:10])
+                if len(changes) > 10:
+                    desc += f"\n• …and {len(changes) - 10} more"
+                desc += "\n\n"
+            desc += f"Use `/snapshot view snapshot_num:{snap_num}` to see current layout."
             embed = discord.Embed(
                 title="<:category:1534195833430474982> Channel Layout Changed",
-                description=(
-                    f"Some channels were moved.\n"
-                    f"Use `/snapshot view snapshot_num:{snap_num}` to see current layout."
-                ),
+                description=desc,
                 color=discord.Color.blue(),
                 timestamp=discord.utils.utcnow(),
             )
@@ -322,6 +354,73 @@ class MemberEvents(commands.Cog):
                 await log_channel.send(embed=embed)
             except discord.Forbidden:
                 pass
+
+    def _diff_layouts(self, old: dict, new: dict) -> list[str]:
+        """Human-readable per-category channel diffs between two layouts."""
+        def index(layout: dict) -> dict[str, set[str]]:
+            out: dict[str, set[str]] = {}
+            for cat in layout.get("categories", []):
+                out.setdefault(cat["name"], set()).update(ch["name"] for ch in cat["channels"])
+            out.setdefault("(no category)", set()).update(
+                ch["name"] for ch in layout.get("uncategorized", []))
+            return out
+
+        before, after = index(old), index(new)
+        changes = []
+        for cat in sorted(set(before) | set(after)):
+            for name in sorted(before.get(cat, set()) - after.get(cat, set())):
+                changes.append(f"`{name}` removed from **{cat}**")
+            for name in sorted(after.get(cat, set()) - before.get(cat, set())):
+                changes.append(f"`{name}` added to **{cat}**")
+        return changes
+    # async def _save_snapshot(self, guild: discord.Guild):
+    #     try:
+    #         await asyncio.sleep(600)
+    #     except asyncio.CancelledError:
+    #         return
+
+    #     if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+    #         return
+
+    #     layout = self._capture_layout(guild)
+    #     layout_json = json.dumps(layout)
+
+    #     if self._last_layout.get(guild.id) == layout_json:
+    #         logger.info(f"[History] Channel layout in {guild.name} reverted to original state. Skipping snapshot.")
+    #         return
+
+    #     now_ts = int(discord.utils.utcnow().timestamp())
+
+    #     async with self.bot.db.execute(
+    #         "SELECT COALESCE(MAX(snapshot_num), 0) + 1 FROM channel_snapshots WHERE guild_id = ?",
+    #         (guild.id,),
+    #     ) as cursor:
+    #         snap_num = (await cursor.fetchone())[0]
+
+    #     await self.bot.db.execute(
+    #         "INSERT INTO channel_snapshots (guild_id, snapshot_num, snapshot_data, created_at) "
+    #         "VALUES (?, ?, ?, ?)",
+    #         (guild.id, snap_num, layout_json, now_ts),
+    #     )
+    #     await self.bot.db.commit()
+
+    #     self._last_layout[guild.id] = layout_json
+
+    #     log_channel = await get_log_channel(self.bot, guild.id, "server-log")
+    #     if log_channel:
+    #         embed = discord.Embed(
+    #             title="<:category:1534195833430474982> Channel Layout Changed",
+    #             description=(
+    #                 f"Some channels were moved.\n"
+    #                 f"Use `/snapshot view snapshot_num:{snap_num}` to see current layout."
+    #             ),
+    #             color=discord.Color.blue(),
+    #             timestamp=discord.utils.utcnow(),
+    #         )
+    #         try:
+    #             await log_channel.send(embed=embed)
+    #         except discord.Forbidden:
+    #             pass
     @commands.Cog.listener()
     async def on_ready(self):
         """Initialize in-memory tracking for all guilds on startup.
@@ -349,6 +448,22 @@ class MemberEvents(commands.Cog):
                 recent = await cursor.fetchone()
 
             if not recent:
+                #--- Skip if the latest snapshot already matches this layout ---
+                #--- (old gate only checked "none in the last hour", so every
+                #--- restart past that window inserted a duplicate row) ---
+                async with self.bot.db.execute(
+                    "SELECT snapshot_data FROM channel_snapshots "
+                    "WHERE guild_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (guild.id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is not None:
+                    try:
+                        if json.loads(row[0]) == layout:
+                            continue
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
                 async with self.bot.db.execute(
                     "SELECT COALESCE(MAX(snapshot_num), 0) + 1 FROM channel_snapshots WHERE guild_id = ?",
                     (guild.id,),

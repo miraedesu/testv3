@@ -119,7 +119,8 @@ class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.cleanup_caches.start()
-        self._logged_pins: set[int] = set()
+        self._pin_cache: dict[int, set[int]] = {}
+        self._readimg_url: str | None = None 
         # pHash blocklist cache (id, phash, source_url, note) tuples.
         self._blocklist_cache: list[tuple[int, str, str, str | None]] | None = None
         self._blocklist_cache_at: float = 0.0
@@ -817,55 +818,109 @@ class Moderation(commands.Cog):
 
     # Pinboard
     @commands.Cog.listener()
-    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
-        if "pinned" not in payload.data:
-            return
-        if not payload.data["pinned"]:
+    async def on_raw_pins_update(self, payload: discord.RawPinsUpdateEvent):
+        if payload.guild_id is None:
             return
         if await is_feature_disabled(self.bot, payload.guild_id, "pinboard"):
             return
-        if payload.message_id in self._logged_pins:  # Already logged
-            return
-        self._logged_pins.add(payload.message_id)
+
         channel = self.bot.get_channel(payload.channel_id)
         if channel is None:
             return
+
+        try:
+            pinned_msgs = await channel.pins()
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            return
+        current_ids = {m.id for m in pinned_msgs}
+
+        #--- None = first event after startup: prime the cache silently ---
+        #--- so pre-existing pins are never re-posted ---
+        known_ids = self._pin_cache.get(payload.channel_id)
+        self._pin_cache[payload.channel_id] = current_ids
+        if known_ids is None:
+            return
+
+        new_ids = current_ids - known_ids
+        if not new_ids:
+            return  # unpin, or duplicate event — nothing newly pinned
 
         log_channel = await get_log_channel(self.bot, payload.guild_id, "pinboard")
         if log_channel is None:
             return
 
-        try:
-            message = await channel.fetch_message(payload.message_id)
-        except discord.NotFound:
-            return
-        except discord.Forbidden:
-            logger.info(
-                f"Permission Denied: Cannot fetch messages from channel #{channel.name} ({channel.id})")
-            return
+        for message in pinned_msgs:
+            if message.id not in new_ids:
+                continue
+            embed = discord.Embed(color=0xffb6c1, timestamp=discord.utils.utcnow())
+            embed.set_author(name=f"{message.author}",
+                             icon_url=message.author.display_avatar.url)
+            msg_text = message.content if message.content else ""
+            embed.description = f"[Jump to message]({message.jump_url})\n{msg_text}"
+            if message.attachments:
+                first_image = next(
+                    (att for att in message.attachments
+                     if att.content_type and att.content_type.startswith("image")),
+                    None,
+                )
+                if first_image:
+                    embed.set_image(url=first_image.url)
+            embed.set_footer(text=f"{message.author.id}")
+            try:
+                await log_channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.info(
+                    f"Permission Denied: Cannot send log embeds to #{log_channel.name} ({log_channel.id})")
+    # @commands.Cog.listener()
+    # async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+    #     if "pinned" not in payload.data:
+    #         return
+    #     if not payload.data["pinned"]:
+    #         return
+    #     if await is_feature_disabled(self.bot, payload.guild_id, "pinboard"):
+    #         return
+    #     if payload.message_id in self._logged_pins:  # Already logged
+    #         return
+    #     self._logged_pins.add(payload.message_id)
+    #     channel = self.bot.get_channel(payload.channel_id)
+    #     if channel is None:
+    #         return
 
-        embed = discord.Embed(color=0xffb6c1, timestamp=discord.utils.utcnow())
-        embed.set_author(name=f"{message.author}",
-                         icon_url=message.author.display_avatar.url)
+    #     log_channel = await get_log_channel(self.bot, payload.guild_id, "pinboard")
+    #     if log_channel is None:
+    #         return
 
-        msg_text = message.content if message.content else ""
-        embed.description = f"[Jump to message]({message.jump_url})\n{msg_text}"
+    #     try:
+    #         message = await channel.fetch_message(payload.message_id)
+    #     except discord.NotFound:
+    #         return
+    #     except discord.Forbidden:
+    #         logger.info(
+    #             f"Permission Denied: Cannot fetch messages from channel #{channel.name} ({channel.id})")
+    #         return
 
-        if message.attachments:
-            first_image = next(
-                (att for att in message.attachments if att.content_type and att.content_type.startswith(
-                    "image")),
-                None,
-            )
-            if first_image:
-                embed.set_image(url=first_image.url)
-        embed.set_footer(text=f"{message.author.id}")
-        try:
-            await log_channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.info(
-                f"Permission Denied: Cannot send log embeds to #{log_channel.name} ({log_channel.id})")
-            return
+    #     embed = discord.Embed(color=0xffb6c1, timestamp=discord.utils.utcnow())
+    #     embed.set_author(name=f"{message.author}",
+    #                      icon_url=message.author.display_avatar.url)
+
+    #     msg_text = message.content if message.content else ""
+    #     embed.description = f"[Jump to message]({message.jump_url})\n{msg_text}"
+
+    #     if message.attachments:
+    #         first_image = next(
+    #             (att for att in message.attachments if att.content_type and att.content_type.startswith(
+    #                 "image")),
+    #             None,
+    #         )
+    #         if first_image:
+    #             embed.set_image(url=first_image.url)
+    #     embed.set_footer(text=f"{message.author.id}")
+    #     try:
+    #         await log_channel.send(embed=embed)
+    #     except discord.Forbidden:
+    #         logger.info(
+    #             f"Permission Denied: Cannot send log embeds to #{log_channel.name} ({log_channel.id})")
+    #         return
 # ---------------- message log: deletes / edits ----------------
 
     @commands.Cog.listener()

@@ -335,6 +335,19 @@ class Database(commands.Cog):
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_boost_list_deadline ON boost_list (deadline)"
         )
+        # --- Emote Usage (cogs/emotes.py) ---
+        await db.execute(""" 
+        CREATE TABLE IF NOT EXISTS emote_usage ( 
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        guild_id INTEGER NOT NULL, 
+        emote_id INTEGER NOT NULL, 
+        emote_name TEXT NOT NULL, 
+        animated INTEGER NOT NULL DEFAULT 0, 
+        used_at INTEGER NOT NULL 
+        ) 
+        """) 
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_emote_usage_guild_time ON emote_usage(guild_id, used_at)") 
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_emote_usage_emote ON emote_usage(emote_id)")
         await db.commit()
         logger.info("[DB] Schema initialization complete.")
 
