@@ -848,7 +848,8 @@ class Moderation(commands.Cog):
         log_channel = await get_log_channel(self.bot, payload.guild_id, "pinboard")
         if log_channel is None:
             return
-
+        if channel.id == log_channel.id:
+            return
         for message in pinned_msgs:
             if message.id not in new_ids:
                 continue
@@ -937,6 +938,8 @@ class Moderation(commands.Cog):
 
         log_channel = await get_log_channel(self.bot, payload.guild_id, "message-log")
         if log_channel is None:
+            return
+        if payload.channel_id == log_channel.id:
             return
 
         channel = self.bot.get_channel(payload.channel_id)
@@ -1034,11 +1037,13 @@ class Moderation(commands.Cog):
     async def on_message_log_edit(self, payload: discord.RawMessageUpdateEvent):
         if payload.guild_id is None:
             return
-
-        cached = payload.cached_message
-        if cached is not None and cached.author.bot:
+        if payload.data.get("edited_timestamp") is None:
+            return
+        author_id = (payload.data.get("author") or {}).get("id")
+        if author_id and int(author_id) == self.bot.user.id:
             return
 
+        cached = payload.cached_message
         new_content = payload.data.get("content")
         if new_content is None:
             return
@@ -1050,6 +1055,9 @@ class Moderation(commands.Cog):
 
         log_channel = await get_log_channel(self.bot, payload.guild_id, "message-log")
         if log_channel is None:
+            return
+        # Guard 3 — never log activity inside the log channel itself.
+        if payload.channel_id == log_channel.id:
             return
 
         channel = self.bot.get_channel(payload.channel_id)
@@ -1089,9 +1097,8 @@ class Moderation(commands.Cog):
 
         try:
             await log_channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.info(
-                f"Permission Denied: Cannot send logs to #{log_channel.name}")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.info(f"Failed to send edit log to #{log_channel.name}")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Moderation(bot))

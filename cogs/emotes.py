@@ -141,7 +141,20 @@ def _prepare_emote_image(data: bytes) -> tuple[bytes, bool, str | None]:
         return b"", False, "Image exceeds the 256 KB emote limit (after conversion)."
     return normalized, False, None
 
-
+def _chunk_plain(parts: list[str], sep: str, cap: int = 1900) -> list[str]:
+    """Join parts into strings under Discord's 2000-char limit."""
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        piece = part if not current else sep + part
+        if current and len(current) + len(piece) > cap:
+            chunks.append(current)
+            current = part
+        else:
+            current += piece
+    if current:
+        chunks.append(current)
+    return chunks
 # ---------------- /emote list (subgroup) ----------------
 
 class EmoteList(app_commands.Group):
@@ -182,28 +195,11 @@ class EmoteList(app_commands.Group):
             )
             return
 
-        #--- Chunk emoji strings into embed-sized pieces ---
-        chunks: list[str] = []
-        current = ""
-        for e in emojis:
-            piece = str(e)
-            if current and len(current) + len(piece) + 1 > 3900:
-                chunks.append(current)
-                current = piece
-            else:
-                current = f"{current} {piece}".strip()
-        if current:
-            chunks.append(current)
-
-        embeds = [
-            discord.Embed(
-                title=f"Emotes — {label} ({len(emojis)})" if i == 0 else "…continued",
-                description=chunk,
-                color=discord.Color.blurple(),
-            )
-            for i, chunk in enumerate(chunks[:10])
-        ]
-        await interaction.response.send_message(embeds=embeds)
+        chunks = _chunk_plain([str(e) for e in emojis], sep=" ")
+        chunks[0] = f"**Emotes — {label} ({len(emojis)})**\n{chunks[0]}"
+        await interaction.response.send_message(content=chunks[0])
+        for extra in chunks[1:]:
+            await interaction.followup.send(content=extra)
 
 
 # ---------------- Cog ----------------
@@ -282,61 +278,37 @@ class Emotes(commands.Cog):
 
     @emote.command(name="top", description="Most-used emotes in this server")
     @app_commands.choices(period=PERIOD_CHOICES)
-    @app_commands.describe(
-        period="Time window (default: last 7 days)",
-        limit="How many emotes to show (1-50)",
-    )
+    @app_commands.describe(period="Time window (default: last 7 days)")
     async def emote_top(
         self,
         interaction: discord.Interaction,
         period: app_commands.Choice[int] | None = None,
-        limit: app_commands.Range[int, 1, 50] = 15,
     ):
-        guild_id = interaction.guild_id
-        if guild_id is None:
+        guild = interaction.guild
+        if guild is None:
             return
+        if not guild.emojis:
+            await interaction.response.send_message("This server has no emotes.", ephemeral=True)
+            return
+
         days = period.value if period is not None else 7
         now_ts = int(discord.utils.utcnow().timestamp())
-
-        if days > 0:
-            sql = (
-                "SELECT emote_id, MAX(emote_name) AS name, MAX(animated) AS animated, "
-                "COUNT(*) AS uses FROM emote_usage WHERE guild_id = ? AND used_at >= ? "
-                "GROUP BY emote_id ORDER BY uses DESC LIMIT ?"
-            )
-            params: tuple = (guild_id, now_ts - days * 86400, limit)
-            label = f"last {days} days"
-        else:
-            sql = (
-                "SELECT emote_id, MAX(emote_name) AS name, MAX(animated) AS animated, "
-                "COUNT(*) AS uses FROM emote_usage WHERE guild_id = ? "
-                "GROUP BY emote_id ORDER BY uses DESC LIMIT ?"
-            )
-            params = (guild_id, limit)
-            label = "all time"
-
+        time_filter = "AND used_at >= ?" if days > 0 else ""
+        params: tuple = (guild.id, now_ts - days * 86400) if days > 0 else (guild.id,)
+        sql = ("SELECT emote_id, COUNT(*) AS uses FROM emote_usage "
+               f"WHERE guild_id = ? {time_filter} GROUP BY emote_id")
         async with self.bot.db.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
+            usage = {row[0]: row[1] for row in await cursor.fetchall()}
 
-        if not rows:
-            await interaction.response.send_message(
-                f"No emote usage recorded in the {label} yet.", ephemeral=True
-            )
-            return
+        ordered = sorted(guild.emojis, key=lambda e: (-usage.get(e.id, 0), e.name.lower()))
+        parts = [f"{str(e)} `{usage.get(e.id, 0)}`" for e in ordered]
+        label = f"last {days} days" if days > 0 else "all time"
 
-        #--- "<:name:id> `uses`, <a:name:id> `uses`, ..." ---
-        parts = [
-            f"<{'a' if animated else ''}:{name}:{eid}> `{uses}`"
-            for eid, name, animated, uses in rows
-        ]
-        embed = discord.Embed(
-            title=f"Top emotes — {label}",
-            description=", ".join(parts)[:4000],
-            color=discord.Color.gold(),
-        )
-        embed.set_footer(text=f"{len(rows)} distinct emotes")
-        await interaction.response.send_message(embed=embed)
-
+        chunks = _chunk_plain(parts, sep=", ")
+        chunks[0] = f"**🏆 Top emotes — {label}**\n{chunks[0]}"
+        await interaction.response.send_message(content=chunks[0])
+        for extra in chunks[1:]:
+            await interaction.followup.send(content=extra)
     # ---------------- /emote upload ----------------
 
     @emote.command(name="upload", description="Add a new emote from a file or URL")
