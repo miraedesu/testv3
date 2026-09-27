@@ -133,7 +133,8 @@ class MyBot(commands.Bot):
                 logger.error(f"Error closing database: {e}")
         logger.info("Closing Discord bot client...")
         await super().close()
-
+    async def on_error(self, event_method: str, *args, **kwargs):
+        logger.exception("Unhandled error in %s", event_method)
 
 bot = MyBot()
 
