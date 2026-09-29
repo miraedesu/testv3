@@ -194,6 +194,10 @@ FEATURE_CHOICES_DATA = [
     ("Member Leave/Kick/Ban Log", "member_leave_log"),
     ("Role Change Log", "role_change_log"),
     ("Channel Permission Log", "channel_permission_log"),
+    ("Emote/Sticker Usage Stats", "emote_stats"),
+    ("Emote Add/Remove Log", "emoji_log"),
+    ("Sticker Add/Remove Log", "sticker_log"),
+    ("Moderation Settings Log", "guild_settings_log"),
 ]
 
 def friendly_permission_name(name: str) -> str:
