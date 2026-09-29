@@ -348,6 +348,19 @@ class Database(commands.Cog):
         """) 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_emote_usage_guild_time ON emote_usage(guild_id, used_at)") 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_emote_usage_emote ON emote_usage(emote_id)")
+        await db.execute(""" 
+        CREATE TABLE IF NOT EXISTS sticker_usage ( 
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        guild_id INTEGER NOT NULL, 
+        sticker_id INTEGER NOT NULL, 
+        sticker_name TEXT NOT NULL, 
+        used_at INTEGER NOT NULL 
+        ) 
+        """) 
+        await db.execute( 
+        "CREATE INDEX IF NOT EXISTS idx_sticker_usage_guild_time " 
+        "ON sticker_usage (guild_id, used_at)" 
+        )
         await db.commit()
         logger.info("[DB] Schema initialization complete.")
 

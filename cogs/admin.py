@@ -124,81 +124,87 @@ class Admin(commands.Cog):
         guild_ids=[DEV_GUILD_ID],
     )
 
-    @admin_group.command(name="disable_feature", description="Disable a passive feature/filter in a target server (bot owner only)")
-    @app_commands.describe(server="Server ID or name to apply this to", feature="Feature to disable")
+    @admin_group.command(name="disable_feature", description="Disable a passive feature/filter in a server — or all servers")
+    @app_commands.describe(
+        feature="Feature to disable",
+        server="Server ID or name (ignored when all_servers is on)",
+        all_servers="Apply to every server the bot is in",
+    )
     @app_commands.choices(feature=FEATURE_CHOICES)
     @app_commands.autocomplete(server=guild_autocomplete)
     @is_bot_owner()
-    async def disable_feature_cmd(self, interaction: discord.Interaction, server: str, feature: app_commands.Choice[str]):
-        guild = resolve_guild(self.bot, server)
-        if guild is None:
-            await interaction.response.send_message(f"Couldn't resolve a server matching `{server}`.", ephemeral=True)
-            return
-        await disable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner")
-        await interaction.response.send_message(f"Disabled **{feature.name}** in **{guild.name}** (`{guild.id}`).", ephemeral=True)
-
-    @admin_group.command(name="list_disabled_features", description="List features disabled in a target server (bot owner only)")
-    @app_commands.describe(server="Server ID or name to check")
-    @app_commands.autocomplete(server=guild_autocomplete)
-    @is_bot_owner()
-    async def list_disabled_features_cmd(self, interaction: discord.Interaction, server: str):
-        guild = resolve_guild(self.bot, server)
-        if guild is None:
-            await interaction.response.send_message(f"Couldn't resolve a server matching `{server}`.", ephemeral=True)
-            return
-
-        rows = await list_disabled_features(self.bot, guild.id)
-        if not rows:
-            await interaction.response.send_message(f"No features are disabled in **{guild.name}**.", ephemeral=True)
+    async def disable_feature_cmd(
+        self,
+        interaction: discord.Interaction,
+        feature: app_commands.Choice[str],
+        server: str | None = None,
+        all_servers: bool = False,
+    ):
+        if not all_servers:
+            guild = resolve_guild(self.bot, server) if server else None
+            if guild is None:
+                await interaction.response.send_message(
+                    "Couldn't resolve a server — pick one with `server`, or flip `all_servers`.",
+                    ephemeral=True,
+                )
+                return
+            await disable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner")
+            await interaction.response.send_message(f"Disabled **{feature.name}** in **{guild.name}** (`{guild.id}`).", ephemeral=True)
             return
 
-        name_lookup = {value: name for name, value in FEATURE_CHOICES_DATA}
-        lines: list[str] = []
-        for value, channel_id, disabled_by in rows:
-            label = name_lookup.get(value, value)
-            if channel_id is None:
-                lines.append(f"**{label}** *(server-wide)* — by `{disabled_by}`")
-            else:
-                ch = guild.get_channel(channel_id)
-                scope = ch.mention if ch else f"`{channel_id}` (deleted)"
-                lines.append(f"**{label}** — in {scope} — by `{disabled_by}`")
-
-        embed = discord.Embed(
-            title=f"Disabled Features — {guild.name}",
-            description="\n".join(lines)[:4096],
-            color=discord.Color.red(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    @admin_group.command(name="disable_command", description="Disable a command in a target server (bot owner only)")
+        await interaction.response.defer(ephemeral=True)
+        ok: list[str] = []
+        failed: list[str] = []
+        for guild in self.bot.guilds:
+            try:
+                await disable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner")
+                ok.append(guild.name)
+            except Exception as e:
+                failed.append(f"• {guild.name} (`{guild.id}`): `{e}`")
+        lines = [f"🚫 Disabled **{feature.name}** in {len(ok)}/{len(self.bot.guilds)} servers."]
+        if failed:
+            lines.append("❌ Failures:\n" + "\n".join(failed[:10]))
+        await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
+    @admin_group.command(name="disable_command", description="Disable a command in a server — or all servers")
     @app_commands.describe(
-        server="Server ID or name to apply this to",
-        command="Command to disable (disabling a group disables all its subcommands)",
+        command="Command to disable (disabling a group disables all its subcommands; use the top-level name for opt-in groups, e.g. `cr`)",
+        server="Server ID or name (ignored when all_servers is on)",
+        all_servers="Apply to every server the bot is in",
     )
     @app_commands.autocomplete(server=guild_autocomplete, command=command_name_autocomplete)
     @is_bot_owner()
-    async def disable_command_cmd(self, interaction: discord.Interaction, server: str, command: str):
-        guild = resolve_guild(self.bot, server)
-        if guild is None:
-            await interaction.response.send_message(f"Couldn't resolve a server matching `{server}`.", ephemeral=True)
+    async def disable_command_cmd(
+        self,
+        interaction: discord.Interaction,   
+        command: str,
+        server: str | None = None,
+        all_servers: bool = False,
+    ):
+        if not all_servers:
+            guild = resolve_guild(self.bot, server) if server else None
+            if guild is None:
+                await interaction.response.send_message(
+                    "Couldn't resolve a server — pick one with `server`, or flip `all_servers`.",
+                    ephemeral=True,
+                )
+                return
+            await disable_command(self.bot, guild.id, command, disabled_by="bot_owner")
+            await interaction.response.send_message(f"Disabled `/{command}` in **{guild.name}** (`{guild.id}`).", ephemeral=True)
             return
-        await disable_command(self.bot, guild.id, command, disabled_by="bot_owner")
-        await interaction.response.send_message(f"Disabled `/{command}` in **{guild.name}** (`{guild.id}`).", ephemeral=True)
 
-    @admin_group.command(name="enable_command", description="Re-enable a previously disabled command in a target server (bot owner only)")
-    @app_commands.describe(server="Server ID or name to apply this to", command="Command to re-enable")
-    @app_commands.autocomplete(server=guild_autocomplete, command=command_name_autocomplete)
-    @is_bot_owner()
-    async def enable_command_cmd(self, interaction: discord.Interaction, server: str, command: str):
-        guild = resolve_guild(self.bot, server)
-        if guild is None:
-            await interaction.response.send_message(f"Couldn't resolve a server matching `{server}`.", ephemeral=True)
-            return
-        was_disabled = await enable_command(self.bot, guild.id, command, disabled_by="bot_owner", enabled_by="bot_owner")
-        if was_disabled:
-            await interaction.response.send_message(f"Re-enabled `/{command}` in **{guild.name}** (`{guild.id}`).", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"`/{command}` wasn't disabled in **{guild.name}**.", ephemeral=True)
-
+        await interaction.response.defer(ephemeral=True)
+        ok: list[str] = []
+        failed: list[str] = []
+        for guild in self.bot.guilds:
+            try:
+                await disable_command(self.bot, guild.id, command, disabled_by="bot_owner")
+                ok.append(guild.name)
+            except Exception as e:
+                failed.append(f"• {guild.name} (`{guild.id}`): `{e}`")
+        lines = [f"🚫 Disabled `/{command}` in {len(ok)}/{len(self.bot.guilds)} servers."]
+        if failed:
+            lines.append("❌ Failures:\n" + "\n".join(failed[:10]))
+        await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
     @admin_group.command(name="list_disabled", description="List commands disabled in a target server (bot owner only)")
     @app_commands.describe(server="Server ID or name to check")
     @app_commands.autocomplete(server=guild_autocomplete)
@@ -394,19 +400,97 @@ class Admin(commands.Cog):
         embed.add_field(name="Disabled", value=disabled_text[:1024], inline=False)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
-    @admin_group.command(name="enable_feature", description="Enable an opt-in feature for a server")
-    @app_commands.describe(server="Server ID or name", feature="Feature to enable")
+    @admin_group.command(name="enable_feature", description="Enable an opt-in feature for a server — or all servers")
+    @app_commands.describe(
+        feature="Feature to enable",
+        server="Server ID or name (ignored when all_servers is on)",
+        all_servers="Apply to every server the bot is in",
+    )
     @app_commands.choices(feature=FEATURE_CHOICES)
     @app_commands.autocomplete(server=guild_autocomplete)
     @is_bot_owner()
-    async def enable_feature_cmd(self, interaction: discord.Interaction, server: str, feature: app_commands.Choice[str]):
-        guild = resolve_guild(self.bot, server)
-        if not guild:
-            await interaction.response.send_message("Server not found.", ephemeral=True)
+    async def enable_feature_cmd(
+        self,
+        interaction: discord.Interaction,
+        feature: app_commands.Choice[str],
+        server: str | None = None,
+        all_servers: bool = False,
+    ):
+        if not all_servers:
+            guild = resolve_guild(self.bot, server) if server else None
+            if guild is None:
+                await interaction.response.send_message(
+                    "Couldn't resolve a server — pick one with `server`, or flip `all_servers`.",
+                    ephemeral=True,
+                )
+                return
+            await enable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner", enabled_by="bot_owner")
+            await interaction.response.send_message(f"✅ Enabled {feature.name} in {guild.name}.", ephemeral=True)
             return
-        await enable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner", enabled_by="bot_owner")
-        await interaction.response.send_message(f"✅ Enabled {feature.name} in {guild.name}.", ephemeral=True)
-        
+
+        await interaction.response.defer(ephemeral=True)
+        ok: list[str] = []
+        failed: list[str] = []
+        for guild in self.bot.guilds:
+            try:
+                await enable_feature(self.bot, guild.id, feature.value, disabled_by="bot_owner", enabled_by="bot_owner")
+                ok.append(guild.name)
+            except Exception as e:
+                failed.append(f"• {guild.name} (`{guild.id}`): `{e}`")
+        lines = [f"✅ Enabled **{feature.name}** in {len(ok)}/{len(self.bot.guilds)} servers."]
+        if failed:
+            lines.append("❌ Failures:\n" + "\n".join(failed[:10]))
+        await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
+
+    @admin_group.command(name="enable_command", description="Re-enable a disabled command in a server — or all servers")
+    @app_commands.describe(
+        command="Command to re-enable (use the top-level name for opt-in groups, e.g. `cr`)",
+        server="Server ID or name (ignored when all_servers is on)",
+        all_servers="Apply to every server the bot is in",
+    )
+    @app_commands.autocomplete(server=guild_autocomplete, command=command_name_autocomplete)
+    @is_bot_owner()
+    async def enable_command_cmd(
+        self,
+        interaction: discord.Interaction,
+        command: str,
+        server: str | None = None,
+        all_servers: bool = False,
+    ):
+        if not all_servers:
+            guild = resolve_guild(self.bot, server) if server else None
+            if guild is None:
+                await interaction.response.send_message(
+                    "Couldn't resolve a server — pick one with `server`, or flip `all_servers`.",
+                    ephemeral=True,
+                )
+                return
+            was_disabled = await enable_command(self.bot, guild.id, command, disabled_by="bot_owner", enabled_by="bot_owner")
+            if was_disabled:
+                await interaction.response.send_message(f"Re-enabled `/{command}` in **{guild.name}** (`{guild.id}`).", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"`/{command}` wasn't disabled in **{guild.name}**.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        reenabled: list[str] = []
+        already: list[str] = []
+        failed: list[str] = []
+        for guild in self.bot.guilds:
+            try:
+                if await enable_command(self.bot, guild.id, command, disabled_by="bot_owner", enabled_by="bot_owner"):
+                    reenabled.append(guild.name)
+                else:
+                    already.append(guild.name)
+            except Exception as e:
+                failed.append(f"• {guild.name} (`{guild.id}`): `{e}`")
+        lines = [f"✅ Re-enabled `/{command}` in {len(reenabled)}/{len(self.bot.guilds)} servers."]
+        if already:
+            shown = ", ".join(already[:20]) + (" …" if len(already) > 20 else "")
+            lines.append(f"— wasn't disabled in {len(already)}: {shown}")
+        if failed:
+            lines.append("❌ Failures:\n" + "\n".join(failed[:10]))
+        await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
     @admin_group.command(name="delete_name", description="Remove a specific name from a user's WhoIs history (bot owner only)")
     @app_commands.describe(
         user_id="The ID of the user whose name you want to delete",

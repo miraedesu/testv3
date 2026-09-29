@@ -13,6 +13,8 @@ import logging
 import asyncio
 import aiohttp
 from common.feature_toggles import is_feature_disabled
+from common.layout import capture_layout   # top of file
+
 
 # Default settings if user hasn't set a timezone
 DEFAULT_DATEPARSER_SETTINGS = {
@@ -396,53 +398,29 @@ class Misc(commands.Cog):
         self.check_reminders.cancel()
         if self._startup_snapshot_task and not self._startup_snapshot_task.done():
             self._startup_snapshot_task.cancel()
-
-    async def _capture_startup_snapshots(self) -> None:
-        """One-shot: capture a snapshot for each guild on bot start,
-        but only if no snapshot exists or the layout differs from the latest.
-        Runtime layout changes are handled by MemberEvents._trigger_snapshot_buffer."""
-        await self.bot.wait_until_ready()
-        for guild in self.bot.guilds:
-            if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
-                continue
-            try:
-                await self._capture_if_changed(guild)
-            except Exception as e:
-                logger.error(f"[Misc] Startup snapshot error for guild {guild.id} ({guild.name}): {e}")
-
     def _capture_guild_layout(self, guild: discord.Guild) -> dict:
-        """Capture the current channel layout of a guild as a JSON-serializable dict."""
-        categories = []
-        for category in guild.categories:
-            channels = []
-            for ch in category.channels:
-                ch_type = "voice" if isinstance(ch, (discord.VoiceChannel, discord.StageChannel)) else "text"
-                channels.append({"name": ch.name, "type": ch_type})
-            categories.append({"name": category.name, "channels": channels})
-
-        uncategorized = []
-        for ch in guild.channels:
-            if isinstance(ch, discord.CategoryChannel):
-                continue
-            if ch.category is None:
-                ch_type = "voice" if isinstance(ch, (discord.VoiceChannel, discord.StageChannel)) else "text"
-                uncategorized.append({"name": ch.name, "type": ch_type})
-
-        return {"categories": categories, "uncategorized": uncategorized}
+        """Shim — shared serializer in common/layout.py keeps this cog's
+        baselines byte-identical to MemberEvents' runtime snapshots."""
+        return capture_layout(guild)
 
     async def _capture_if_changed(self, guild: discord.Guild) -> None:
         current_data = self._capture_guild_layout(guild)
         current_json = json.dumps(current_data, sort_keys=True)
 
+        #--- Skip only when it matches the LATEST snapshot (timeline model:
+        #--- A→B→A records A again as a new snapshot) ---
         async with self.bot.db.execute(
             "SELECT snapshot_data FROM channel_snapshots "
-            "WHERE guild_id = ? ORDER BY created_at DESC LIMIT 1",
+            "WHERE guild_id = ? ORDER BY snapshot_num DESC LIMIT 1",
             (guild.id,),
         ) as cursor:
             row = await cursor.fetchone()
 
         if row is not None:
-            existing_json = json.dumps(json.loads(row[0]), sort_keys=True)
+            try:
+                existing_json = json.dumps(json.loads(row[0]), sort_keys=True)
+            except (json.JSONDecodeError, TypeError):
+                existing_json = None  # corrupt row → treat as changed, re-baseline
             if current_json == existing_json:
                 logger.info(f"[Misc] Guild {guild.id} ({guild.name}) layout unchanged — skipping snapshot.")
                 return
@@ -456,6 +434,39 @@ class Misc(commands.Cog):
         )
         await self.bot.db.commit()
         logger.info(f"[Misc] Captured snapshot #{snap_num} for guild {guild.id} ({guild.name}).")
+        
+    async def _capture_startup_snapshots(self) -> None:
+        await self.bot.wait_until_ready()
+        for guild in self.bot.guilds:
+            try:
+                if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+                    #--- Silent skips are how a whole server ends up with zero
+                    #--- snapshots and no clue why. Log it. ---
+                    logger.info(
+                        f"[Misc] channel_layout_screenshot disabled for "
+                        f"{guild.name} ({guild.id}) — skipping baseline snapshot.")
+                    continue
+                await self._capture_if_changed(guild)
+            except Exception as e:
+                logger.error(
+                    f"[Misc] Startup snapshot error for guild {guild.id} ({guild.name}): {e}",
+                    exc_info=True,
+                )
+        logger.info(f"[Misc] Startup snapshot pass complete ({len(self.bot.guilds)} guilds).")
+    # async def _capture_startup_snapshots(self) -> None:
+    #     await self.bot.wait_until_ready()
+    #     for guild in self.bot.guilds:
+    #         try:
+    #             #--- Feature check INSIDE the try: one DB hiccup must not
+    #             #--- kill snapshots for every remaining guild ---
+    #             if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+    #                 continue
+    #             await self._capture_if_changed(guild)
+    #         except Exception as e:
+    #             logger.error(
+    #                 f"[Misc] Startup snapshot error for guild {guild.id} ({guild.name}): {e}",
+    #                 exc_info=True,
+    #             )
 
     @tasks.loop(seconds=15.0)
     async def check_reminders(self):
@@ -1445,6 +1456,17 @@ class Misc(commands.Cog):
         data1 = json.loads(row1[0])
         data2 = json.loads(row2[0])
 
+        #--- Identical layouts: one clear message instead of two identical columns ---
+        if data1 == data2:
+            embed = discord.Embed(
+                title=f"Snapshots #{snapshot_num1} & #{snapshot_num2} are identical",
+                description="Both snapshots capture the exact same channel layout — nothing to compare.",
+                color=discord.Color.green(),
+            )
+            embed.add_field(name=f"#{snapshot_num1} captured", value=f"<t:{row1[1]}:F>", inline=True)
+            embed.add_field(name=f"#{snapshot_num2} captured", value=f"<t:{row2[1]}:F>", inline=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
         cats1 = {c['name']: c['channels'] for c in data1.get("categories", [])}
         cats2 = {c['name']: c['channels'] for c in data2.get("categories", [])}
         uncat1 = data1.get("uncategorized", [])

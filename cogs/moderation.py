@@ -120,7 +120,9 @@ class Moderation(commands.Cog):
         self.bot = bot
         self.cleanup_caches.start()
         self._pin_cache: dict[int, set[int]] = {}
-        self._readimg_url: str | None = None 
+        self._readimg_url: str | None = None
+        self._readimg_lock = asyncio.Lock()
+        self._kv_table_ready = False
         # pHash blocklist cache (id, phash, source_url, note) tuples.
         self._blocklist_cache: list[tuple[int, str, str, str | None]] | None = None
         self._blocklist_cache_at: float = 0.0
@@ -128,24 +130,73 @@ class Moderation(commands.Cog):
     def cog_unload(self):
         self.cleanup_caches.cancel()
         
+    async def _ensure_kv_table(self) -> None:
+        if self._kv_table_ready:
+            return
+        await self.bot.db.execute(
+            "CREATE TABLE IF NOT EXISTS bot_kv (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        await self.bot.db.commit()
+        self._kv_table_ready = True
+
     async def _get_readimg_url(self) -> str | None:
-        """Uploads readimg.png once and caches the Discord CDN URL.
-        All subsequent log messages reference the URL instead of
-        re-uploading the file every time — avoids attachment rate limits."""
+        """Persistent CDN cache for readimg.png — uploads at most once, ever.
+
+        We persist the uploaded message's (channel_id, message_id) and
+        re-fetch it when needed. fetch_message returns a FRESH signed URL
+        every time, so Discord's expiring attachment-link signatures can
+        never break thumbnails. The file is only re-uploaded if the stored
+        message is actually gone (deleted, channel purged)."""
         if self._readimg_url:
             return self._readimg_url
-        try:
-            channel = self.bot.get_channel(DMLOG_CHANNEL_ID)
-            if channel is None:
-                channel = await self.bot.fetch_channel(DMLOG_CHANNEL_ID)
-            if channel is not None:
-                msg = await channel.send(file=discord.File(readimg))
-                if msg.attachments:
-                    self._readimg_url = msg.attachments[0].url
-                    logger.info(f"[Moderation] Cached readimg CDN URL: {self._readimg_url}")
-        except Exception as e:
-            logger.error(f"[Moderation] Failed to cache readimg URL: {e}")
-        return self._readimg_url
+
+        async with self._readimg_lock:  # two concurrent logs → one upload
+            if self._readimg_url:       # re-check after acquiring
+                return self._readimg_url
+            try:
+                await self._ensure_kv_table()
+
+                #--- 1. Stored message still alive? Re-fetch → fresh URL ---
+                async with self.bot.db.execute(
+                    "SELECT value FROM bot_kv WHERE key = 'readimg_msg_ref'"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row:
+                    try:
+                        channel_id_s, message_id_s = row[0].split(":")
+                        channel = (
+                            self.bot.get_channel(int(channel_id_s))
+                            or await self.bot.fetch_channel(int(channel_id_s))
+                        )
+                        msg = await channel.fetch_message(int(message_id_s))
+                        if msg.attachments:
+                            self._readimg_url = msg.attachments[0].url
+                            return self._readimg_url
+                    except (discord.NotFound, discord.Forbidden,
+                            discord.HTTPException, ValueError):
+                        logger.info(
+                            "[Moderation] Stored readimg message is gone — re-uploading.")
+
+                #--- 2. No ref / dead message → upload once, persist the ref ---
+                channel = self.bot.get_channel(DMLOG_CHANNEL_ID)
+                if channel is None:
+                    channel = await self.bot.fetch_channel(DMLOG_CHANNEL_ID)
+                if channel is not None:
+                    msg = await channel.send(file=discord.File(readimg))
+                    if msg.attachments:
+                        self._readimg_url = msg.attachments[0].url
+                        await self.bot.db.execute(
+                            "INSERT INTO bot_kv (key, value) VALUES ('readimg_msg_ref', ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (f"{channel.id}:{msg.id}",),
+                        )
+                        await self.bot.db.commit()
+                        logger.info(
+                            f"[Moderation] readimg uploaded once; cached ref "
+                            f"{channel.id}:{msg.id} — no re-upload on restart.")
+            except Exception as e:
+                logger.error(f"[Moderation] Failed to cache readimg URL: {e}")
+            return self._readimg_url
     @commands.Cog.listener()
     async def on_ready(self):
         global _recycle_url
@@ -818,26 +869,33 @@ class Moderation(commands.Cog):
 
     # Pinboard
     @commands.Cog.listener()
-    async def on_raw_pins_update(self, payload: discord.RawPinsUpdateEvent):
-        if payload.guild_id is None:
-            return
-        if await is_feature_disabled(self.bot, payload.guild_id, "pinboard"):
-            return
+    async def on_guild_channel_pins_update(self, channel, last_pin):
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return  # DM pins aren't logged
+        await self._pinboard_sync(channel)
 
-        channel = self.bot.get_channel(payload.channel_id)
-        if channel is None:
+    async def _pinboard_sync(self, channel):
+        if await is_feature_disabled(self.bot, channel.guild.id, "pinboard"):
             return
 
         try:
-            pinned_msgs = await channel.pins()
+            pins_obj = channel.pins()
+            if hasattr(pins_obj, "__aiter__"):
+                # discord.py 2.6+: pins() is a paginated async iterator
+                pinned_msgs = [m async for m in pins_obj]
+            else:
+                # discord.py <= 2.5: pins() is a coroutine returning a list
+                pinned_msgs = await pins_obj
         except (discord.Forbidden, discord.HTTPException, AttributeError):
             return
+
         current_ids = {m.id for m in pinned_msgs}
 
         #--- None = first event after startup: prime the cache silently ---
         #--- so pre-existing pins are never re-posted ---
-        known_ids = self._pin_cache.get(payload.channel_id)
-        self._pin_cache[payload.channel_id] = current_ids
+        known_ids = self._pin_cache.get(channel.id)
+        self._pin_cache[channel.id] = current_ids
         if known_ids is None:
             return
 
@@ -845,7 +903,7 @@ class Moderation(commands.Cog):
         if not new_ids:
             return  # unpin, or duplicate event — nothing newly pinned
 
-        log_channel = await get_log_channel(self.bot, payload.guild_id, "pinboard")
+        log_channel = await get_log_channel(self.bot, channel.guild.id, "pinboard")
         if log_channel is None:
             return
         if channel.id == log_channel.id:
@@ -1039,8 +1097,8 @@ class Moderation(commands.Cog):
             return
         if payload.data.get("edited_timestamp") is None:
             return
-        author_id = (payload.data.get("author") or {}).get("id")
-        if author_id and int(author_id) == self.bot.user.id:
+        author = payload.data.get("author") or {}
+        if author.get("bot") or payload.data.get("webhook_id"):
             return
 
         cached = payload.cached_message

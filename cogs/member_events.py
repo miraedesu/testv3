@@ -13,6 +13,7 @@ import re
 from common.constants import bannedimg, friendly_permission_name, kickimg, leaveimg
 from common.settings_store import get_log_channel
 from common.feature_toggles import is_feature_disabled
+from common.layout import capture_layout 
 
 logger = logging.getLogger(__name__)
 
@@ -246,26 +247,8 @@ class MemberEvents(commands.Cog):
         return {c.id: (c.position, c.category_id) for c in guild.channels}
     
     def _capture_layout(self, guild: discord.Guild) -> dict:
-        """Capture the current channel layout as a JSON-serializable dict."""
-        layout = {"categories": [], "uncategorized": []}
-        
-        for cat in sorted(guild.categories, key=lambda c: c.position):
-            cat_data = {"name": cat.name, "channels": []}
-            for ch in sorted(cat.channels, key=lambda c: c.position):
-                cat_data["channels"].append({
-                    "name": ch.name,
-                    "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text"
-                })
-            layout["categories"].append(cat_data)
-            
-        for ch in guild.channels:
-            if ch.category is None and not isinstance(ch, discord.CategoryChannel):
-                layout["uncategorized"].append({
-                    "name": ch.name,
-                    "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text"
-                })
-                
-        return layout
+        """Shim — shared serializer; see common/layout.py."""
+        return capture_layout(guild)
     def _trigger_snapshot_buffer(self, guild: discord.Guild):
         """Starts/resets a 10-minute timer. If no more moves happen for 10 mins, it saves a snapshot."""
         if guild.id in self._snapshot_timers:
@@ -275,7 +258,7 @@ class MemberEvents(commands.Cog):
         self._snapshot_timers[guild.id] = asyncio.create_task(self._save_snapshot(guild))
     async def _save_snapshot(self, guild: discord.Guild):
         try:
-            await asyncio.sleep(600)
+            await asyncio.sleep(60)
         except asyncio.CancelledError:
             return
 
@@ -290,10 +273,28 @@ class MemberEvents(commands.Cog):
             logger.info(f"[History] Channel layout in {guild.name} unchanged. Skipping snapshot.")
             return
 
-        #--- Revert guard: was this EXACT layout ever recorded before? ---
-        #--- Old code only compared vs the LAST snapshot, so
-        #--- "move out → snapshot → move back" always saved again and
-        #--- ping-ponged 2 new snapshots per out-and-back. ---
+        #--- Skip ONLY on an exact match with the LATEST snapshot.
+        #--- (Revert-anywhere guard removed: A→B→A now records #3,
+        #--- keeping "highest snapshot_num = current layout" true.) ---
+        normalized_layout = json.dumps(layout, sort_keys=True)
+        async with self.bot.db.execute(
+            "SELECT snapshot_data FROM channel_snapshots "
+            "WHERE guild_id = ? ORDER BY snapshot_num DESC LIMIT 1",
+            (guild.id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            try:
+                if json.dumps(json.loads(row[0]), sort_keys=True) == normalized_layout:
+                    self._last_layout[guild.id] = layout_json  # keep memory in sync
+                    logger.info(f"[History] Channel layout in {guild.name} unchanged (matches latest snapshot). Skipping.")
+                    return
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        #--- Revert DETECTION (notification-only): does this exact layout exist
+        #--- anywhere in history? Recorded either way; embed only for new layouts. ---
+        layout_seen_before = False
         async with self.bot.db.execute(
             "SELECT snapshot_data FROM channel_snapshots WHERE guild_id = ?",
             (guild.id,),
@@ -301,12 +302,9 @@ class MemberEvents(commands.Cog):
             rows = await cursor.fetchall()
         for (data_str,) in rows:
             try:
-                if json.loads(data_str) == layout:
-                    self._last_layout[guild.id] = layout_json  # keep memory in sync
-                    logger.info(
-                        f"[History] Channel layout in {guild.name} reverted to a "
-                        f"previously recorded state. Skipping snapshot.")
-                    return
+                if json.dumps(json.loads(data_str), sort_keys=True) == normalized_layout:
+                    layout_seen_before = True
+                    break
             except (json.JSONDecodeError, TypeError):
                 continue
 
@@ -335,6 +333,14 @@ class MemberEvents(commands.Cog):
             pass
         self._last_layout[guild.id] = layout_json
 
+        #--- Reverted to a previously recorded state → snapshot saved,
+        #--- but no server-log embed. ---
+        if layout_seen_before:
+            logger.info(
+                f"[History] Layout in {guild.name} reverted to a previously recorded "
+                f"state — saved as snapshot #{snap_num} (embed suppressed).")
+            return
+
         log_channel = await get_log_channel(self.bot, guild.id, "server-log")
         if log_channel:
             desc = ""
@@ -354,7 +360,6 @@ class MemberEvents(commands.Cog):
                 await log_channel.send(embed=embed)
             except discord.Forbidden:
                 pass
-
     def _diff_layouts(self, old: dict, new: dict) -> list[str]:
         """Human-readable per-category channel diffs between two layouts."""
         def index(layout: dict) -> dict[str, set[str]]:
@@ -423,64 +428,39 @@ class MemberEvents(commands.Cog):
     #             pass
     @commands.Cog.listener()
     async def on_ready(self):
-        """Initialize in-memory tracking for all guilds on startup.
-        Baseline DB snapshots are handled by the Misc cog."""
+        """Initialize in-memory tracking. DB baselines are owned by the Misc
+        cog (single writer — the duplicate baseline block was removed)."""
         for guild in self.bot.guilds:
-            # 1. Save in-memory snapshot for position tracking
             self._channel_snapshots[guild.id] = self._take_snapshot(guild)
-
-            # 2. Initialize the last layout memory (used by _save_snapshot
-            #    to skip saving if the layout reverted to its prior state)
             if guild.id not in self._last_layout:
                 self._last_layout[guild.id] = json.dumps(self._capture_layout(guild))
-
-            # 3. Save an initial baseline snapshot to the database (gated)
-            if await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
-                continue
-
-            layout = self._capture_layout(guild)
-            now_ts = int(discord.utils.utcnow().timestamp())
-
-            async with self.bot.db.execute(
-                "SELECT 1 FROM channel_snapshots WHERE guild_id = ? AND created_at > ?",
-                (guild.id, now_ts - 3600),
-            ) as cursor:
-                recent = await cursor.fetchone()
-
-            if not recent:
-                #--- Skip if the latest snapshot already matches this layout ---
-                #--- (old gate only checked "none in the last hour", so every
-                #--- restart past that window inserted a duplicate row) ---
-                async with self.bot.db.execute(
-                    "SELECT snapshot_data FROM channel_snapshots "
-                    "WHERE guild_id = ? ORDER BY created_at DESC LIMIT 1",
-                    (guild.id,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if row is not None:
-                    try:
-                        if json.loads(row[0]) == layout:
-                            continue
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                async with self.bot.db.execute(
-                    "SELECT COALESCE(MAX(snapshot_num), 0) + 1 FROM channel_snapshots WHERE guild_id = ?",
-                    (guild.id,),
-                ) as cursor:
-                    snap_num = (await cursor.fetchone())[0]
-
-                await self.bot.db.execute(
-                    "INSERT INTO channel_snapshots (guild_id, snapshot_num, snapshot_data, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (guild.id, snap_num, json.dumps(layout), now_ts),
-                )
-                await self.bot.db.commit()
-                logger.info(f"[MemberEvents] Saved baseline snapshot #{snap_num} for {guild.name}")
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
         self._channel_snapshots[guild.id] = self._take_snapshot(guild)
+        if guild.id not in self._last_layout:
+            self._last_layout[guild.id] = json.dumps(self._capture_layout(guild))
+        #--- DB baseline for guilds joined mid-session (startup only covers
+        #--- guilds the bot was already in) ---
+        try:
+            if not await is_feature_disabled(self.bot, guild.id, "channel_layout_screenshot"):
+                misc_cog = self.bot.get_cog("Misc")
+                if misc_cog:
+                    await misc_cog._capture_if_changed(guild)
+        except Exception as e:
+            logger.error(f"[MemberEvents] Join baseline snapshot failed for {guild.id}: {e}")
 
+    #--- New: creates/deletes change the layout too — previously never snapshotted ---
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        if await is_feature_disabled(self.bot, channel.guild.id, "channel_layout_screenshot"):
+            return
+        self._trigger_snapshot_buffer(channel.guild)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        if await is_feature_disabled(self.bot, channel.guild.id, "channel_layout_screenshot"):
+            return
+        self._trigger_snapshot_buffer(channel.guild)
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         guild = member.guild
@@ -904,7 +884,9 @@ class MemberEvents(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
         # 1. Handle Position/Category changes (Snapshot Buffer)
-        if before.position != after.position or before.category_id != after.category_id:
+        if (before.position != after.position
+                or before.category_id != after.category_id
+                or before.name != after.name):
             if not await is_feature_disabled(self.bot, after.guild.id, "channel_layout_screenshot"):
                 self._trigger_snapshot_buffer(after.guild)
 
@@ -1142,6 +1124,203 @@ class MemberEvents(commands.Cog):
         embed.set_footer(text=f"Level {guild.premium_tier}")
         try:
             await log_channel.send(embed=embed, view=BoostAttributionView())
+        except discord.Forbidden:
+            logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
+    #--- Emote / sticker / moderation-setting logging ---------------------
+
+    async def _recent_audit_actor(
+        self, guild: discord.Guild, actions, target_ids: set[int] | None = None,
+    ) -> discord.abc.User | None:
+        """Best-effort: the user behind a recent expression audit-log entry."""
+        now = discord.utils.utcnow()
+        try:
+            for action in actions:
+                async for entry in guild.audit_logs(action=action, limit=5):
+                    if (now - entry.created_at).total_seconds() >= 15:
+                        continue
+                    if target_ids and getattr(entry.target, "id", None) not in target_ids:
+                        continue
+                    return entry.user
+        except discord.Forbidden:
+            logger.info("Bot lacks 'View Audit Log' permission to check logs.")
+        return None
+
+    @staticmethod
+    def _pretty_enum(value) -> str:
+        return value.name.replace("_", " ").title()
+
+    @commands.Cog.listener()
+    async def on_guild_emojis_update(self, guild: discord.Guild, before, after):
+        if await is_feature_disabled(self.bot, guild.id, "emoji_log"):
+            return
+        before_map = {e.id: e for e in before}
+        after_map = {e.id: e for e in after}
+        added = [e for e in after if e.id not in before_map]
+        removed = [e for e in before if e.id not in after_map]
+        renamed = [
+            f"`{before_map[e.id].name}` → `{e.name}`"
+            for e in after
+            if e.id in before_map and e.name != before_map[e.id].name
+        ]
+        if not (added or removed or renamed):
+            return
+
+        log_channel = await get_log_channel(self.bot, guild.id, "server-log")
+        if log_channel is None:
+            return
+
+        await asyncio.sleep(1.5)
+        actor = await self._recent_audit_actor(
+            guild,
+            (
+                discord.AuditLogAction.emoji_create,
+                discord.AuditLogAction.emoji_update,
+                discord.AuditLogAction.emoji_delete,
+            ),
+            {e.id for e in added} | {e.id for e in removed} | set(after_map),
+        )
+
+        if added and not removed and not renamed:
+            title, color = "Emote Added", discord.Color.green()
+        elif removed and not added and not renamed:
+            title, color = "Emote Removed", discord.Color.red()
+        else:
+            title, color = "Emotes Updated", discord.Color.gold()
+
+        embed = discord.Embed(
+            title=title,
+            description=(f"Updated by {actor.mention}." if actor else None),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        if added:
+            embed.add_field(name=f"Added ({len(added)})",
+                            value=", ".join(f"{e} `{e.name}`" for e in added)[:1024],
+                            inline=False)
+        if removed:
+            embed.add_field(name=f"Removed ({len(removed)})",
+                            value=", ".join(f"`{e.name}`" for e in removed)[:1024],
+                            inline=False)
+        if renamed:
+            embed.add_field(name=f"Renamed ({len(renamed)})",
+                            value=", ".join(renamed)[:1024], inline=False)
+        embed.add_field(name="Total", value=f"{len(after)}/{guild.emoji_limit} slots", inline=False)
+        try:
+            await log_channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
+
+    @commands.Cog.listener()
+    async def on_guild_stickers_update(self, guild: discord.Guild, before, after):
+        if await is_feature_disabled(self.bot, guild.id, "sticker_log"):
+            return
+        before_map = {s.id: s for s in before}
+        after_map = {s.id: s for s in after}
+        added = [s for s in after if s.id not in before_map]
+        removed = [s for s in before if s.id not in after_map]
+        renamed = [
+            f"`{before_map[s.id].name}` → `{s.name}`"
+            for s in after
+            if s.id in before_map and s.name != before_map[s.id].name
+        ]
+        if not (added or removed or renamed):
+            return
+
+        log_channel = await get_log_channel(self.bot, guild.id, "server-log")
+        if log_channel is None:
+            return
+
+        await asyncio.sleep(1.5)
+        actor = await self._recent_audit_actor(
+            guild,
+            (
+                discord.AuditLogAction.sticker_create,
+                discord.AuditLogAction.sticker_update,
+                discord.AuditLogAction.sticker_delete,
+            ),
+            {s.id for s in added} | {s.id for s in removed} | set(after_map),
+        )
+
+        if added and not removed and not renamed:
+            title, color = "Sticker Added", discord.Color.green()
+        elif removed and not added and not renamed:
+            title, color = "Sticker Removed", discord.Color.red()
+        else:
+            title, color = "Stickers Updated", discord.Color.gold()
+
+        embed = discord.Embed(
+            title=title,
+            description=(f"Updated by {actor.mention}." if actor else None),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        if added:
+            embed.add_field(name=f"Added ({len(added)})",
+                            value=", ".join(f"`{s.name}` ({s.format.name})" for s in added)[:1024],
+                            inline=False)
+        if removed:
+            embed.add_field(name=f"Removed ({len(removed)})",
+                            value=", ".join(f"`{s.name}`" for s in removed)[:1024],
+                            inline=False)
+        if renamed:
+            embed.add_field(name=f"Renamed ({len(renamed)})",
+                            value=", ".join(renamed)[:1024], inline=False)
+        embed.add_field(name="Total", value=f"{len(after)}/{guild.sticker_limit} slots", inline=False)
+        try:
+            await log_channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
+
+    @commands.Cog.listener("on_guild_update")
+    async def on_guild_settings_update(self, before: discord.Guild, after: discord.Guild):
+        """Moderation / safety settings: verification level, content filter,
+        default notification level, 2FA requirement. A second listener on the
+        same event (decorator renames it) so the boost-reconciliation
+        on_guild_update above stays untouched."""
+        if await is_feature_disabled(self.bot, after.id, "guild_settings_log"):
+            return
+
+        changes: list[str] = []
+        if before.verification_level != after.verification_level:
+            changes.append(
+                f"**Verification level:** "
+                f"{self._pretty_enum(before.verification_level)} → {self._pretty_enum(after.verification_level)}"
+            )
+        if before.explicit_content_filter != after.explicit_content_filter:
+            changes.append(
+                f"**Content filter:** "
+                f"{self._pretty_enum(before.explicit_content_filter)} → {self._pretty_enum(after.explicit_content_filter)}"
+            )
+        if before.default_notifications != after.default_notifications:
+            changes.append(
+                f"**Default notification level:** "
+                f"{self._pretty_enum(before.default_notifications)} → {self._pretty_enum(after.default_notifications)}"
+            )
+        if bool(before.mfa_level) != bool(after.mfa_level):
+            changes.append(
+                "**2FA requirement for moderation:** "
+                + ("Required" if after.mfa_level else "No longer required")
+            )
+        if not changes:
+            return
+
+        log_channel = await get_log_channel(self.bot, after.id, "server-log")
+        if log_channel is None:
+            return
+
+        await asyncio.sleep(1.5)
+        actor = await self._recent_audit_actor(after, (discord.AuditLogAction.guild_update,))
+
+        embed = discord.Embed(
+            title="Server Moderation Settings Changed",
+            description="\n".join(changes),
+            color=discord.Color.gold(),
+            timestamp=discord.utils.utcnow(),
+        )
+        if actor:
+            embed.add_field(name="Changed by", value=actor.mention, inline=False)
+        try:
+            await log_channel.send(embed=embed)
         except discord.Forbidden:
             logger.info(f"Permission Denied: Cannot send logs to #{log_channel.name}")
 async def setup(bot: commands.Bot):
