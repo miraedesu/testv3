@@ -146,18 +146,22 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     elif isinstance(error, app_commands.MissingPermissions):
         msg = "You need Administrator permission to use this command."
     elif isinstance(error, app_commands.TransformerError):
-        msg=  "Could not find that member. They may have left the server or typed their name incorrectly."
+        msg = "Could not find that member. They may have left the server or typed their name incorrectly."
     elif isinstance(error, app_commands.NoPrivateMessage):
         msg = "This command must be used in a server."
     elif isinstance(error, app_commands.CheckFailure):
         msg = "You don't have permission to use this command."
     else:
-        raise error
+        cmd = interaction.command.qualified_name if interaction.command else "unknown"
+        logger.error("Unhandled app command error in /%s", cmd, exc_info=error)
+        msg = "Something went wrong while running that command — the error has been logged."
     if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
     else:
         await interaction.response.send_message(msg, ephemeral=True)
-
 
 @bot.event
 async def on_ready():
